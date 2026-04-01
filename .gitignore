@@ -1,0 +1,36 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+env/
+.venv/
+venv/
+
+# Local environment files
+.env
+.env.*
+!.env.dist
+
+# Tool and editor caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local Strandex runtime artifacts
+.strandex/
+.omnidex/
+output-*.md
+
+# Local project tooling files
+.codex
