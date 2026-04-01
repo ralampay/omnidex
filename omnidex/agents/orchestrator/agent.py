@@ -15,6 +15,7 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from omnidex.memory import MemoryManager
+from omnidex.agents.research_assistant import ResearchAssistant
 from omnidex.runtime import LocalChatModel, LocalLLMSettings
 
 
@@ -25,6 +26,32 @@ For now, behave as a capable general chat assistant. Be concise, accurate, and e
 about uncertainty. Do not claim to access remote services or tools unless the user asks
 for code or instructions to add them later.
 """
+
+ROUTER_SYSTEM_PROMPT = """You are a routing agent.
+
+Your task is to choose the best handler for the user input.
+
+Available options:
+- chat: general conversation
+- research_assistant: research queries, summarization, PDFs, keyword extraction
+
+Rules:
+- Choose "research_assistant" if the query involves:
+  - summarization
+  - PDFs
+  - documents
+  - extracting keywords
+  - analysis of text
+- Otherwise choose "chat"
+
+Respond with ONLY one word:
+chat
+or
+research_assistant
+
+Do not explain your answer.
+"""
+
 
 class OrchestratorAgent:
     """Local first-chat agent with a Rich terminal UI."""
@@ -43,6 +70,9 @@ class OrchestratorAgent:
             short_term_limit=self._short_term_limit(),
             long_term_path=self._memory_path(),
         )
+        self.agents = {
+            "research_assistant": ResearchAssistant(console=self.console),
+        }
 
     def run(self) -> int:
         """Run the interactive chat session."""
@@ -68,17 +98,69 @@ class OrchestratorAgent:
             return ""
 
         context = self.memory.get_context(user_prompt)
-        response, already_rendered = self._generate_response(
-            user_prompt,
-            context=context,
-            stream=stream,
-        )
+        with self.console.status(
+            "[bold blue]OmniDex is routing...[/bold blue]",
+            spinner="dots",
+        ):
+            try:
+                route = self._llm_route(user_prompt, context)
+            except Exception:
+                route = "chat"
+        self._render_event(f"Route selected: {route} (llm)", style="blue")
+        self._debug_route(route)
+
+        if route == "chat":
+            response, already_rendered = self._generate_response(
+                user_prompt,
+                context=context,
+                stream=stream,
+            )
+            responder = "OmniDex"
+        else:
+            agent = self.agents[route]
+            self._render_event(f"Delegating to agent: {agent.name}", style="cyan")
+            with self.console.status(
+                f"[bold cyan]{agent.name} is working...[/bold cyan]",
+                spinner="dots",
+            ):
+                response = agent.safe_run(user_prompt, context=context)
+            already_rendered = False
+            responder = agent.name
+
         self.memory.add_interaction("user", user_prompt)
         self.memory.add_interaction("assistant", response)
         self.memory.extract_and_store(user_prompt, response)
+        self._render_event(f"Response source: {responder}", style="green")
         if not already_rendered:
-            self._render_response(response)
+            self._render_response(response, title=responder)
         return response
+
+    def _llm_route(self, user_input: str, context: str) -> str:
+        """Ask the local model to choose a route and normalize the result."""
+        routing_input = user_input.strip()
+        if context.strip():
+            routing_input = (
+                f"Context:\n{context.strip()}\n\n"
+                f"User input:\n{routing_input}"
+            )
+
+        messages = [
+            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+            {"role": "user", "content": routing_input},
+        ]
+        completion = self.model.complete(messages, stream=False)
+        choice = completion["choices"][0]
+        output = choice["message"]["content"].strip().lower()
+        if "research" in output:
+            return "research_assistant"
+        if "chat" in output:
+            return "chat"
+        return "chat"
+
+    def _debug_route(self, route: str) -> None:
+        """Print a dim route trace when verbose logging is enabled."""
+        if self.settings.verbose:
+            self.console.print(f"[dim]Route selected:[/dim] {route}")
 
     def _generate_response(
         self,
@@ -173,11 +255,25 @@ class OrchestratorAgent:
             )
         )
 
-    def _render_response(self, response: str) -> None:
-        """Render the assistant response."""
-        self.console.print(self._assistant_panel(response))
+    def _render_event(self, message: str, *, style: str = "cyan") -> None:
+        """Render a standard orchestrator event line."""
+        title = Text("orchestrator", style=f"bold {style}")
+        body = Text(message)
+        self.console.print(
+            Panel.fit(body, title=title, border_style=style, padding=(0, 1))
+        )
 
-    def _assistant_panel(self, response: str, *, status: str | None = None) -> Panel:
+    def _render_response(self, response: str, *, title: str = "OmniDex") -> None:
+        """Render the assistant response."""
+        self.console.print(self._assistant_panel(response, title=title))
+
+    def _assistant_panel(
+        self,
+        response: str,
+        *,
+        status: str | None = None,
+        title: str = "OmniDex",
+    ) -> Panel:
         """Build the assistant panel for plain text or Markdown output."""
         if status and not response:
             body = Group(
@@ -190,7 +286,7 @@ class OrchestratorAgent:
                 if self.settings.render_markdown
                 else Text(response or " ")
             )
-        return Panel(body, title="OmniDex", border_style="magenta")
+        return Panel(body, title=title, border_style="magenta")
 
     def _build_messages(self, user_prompt: str, context: str) -> list[dict[str, str]]:
         """Construct the message list sent to the LLM."""
