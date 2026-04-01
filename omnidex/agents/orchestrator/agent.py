@@ -9,7 +9,6 @@ from typing import Sequence
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
-from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.spinner import Spinner
 from rich.text import Text
@@ -97,27 +96,35 @@ class OrchestratorAgent:
         if not user_prompt:
             return ""
 
-        context = self.memory.get_context(user_prompt)
+        context = self._bounded_context(self.memory.get_context(user_prompt))
         with self.console.status(
             "[bold blue]OmniDex is routing...[/bold blue]",
             spinner="dots",
         ):
             try:
-                route = self._llm_route(user_prompt, context)
+                route, confidence, route_source = self._route(user_prompt, context)
             except Exception:
-                route = "chat"
-        self._render_event(f"Route selected: {route} (llm)", style="blue")
-        self._debug_route(route)
+                route = self._heuristic_route(user_prompt)
+                confidence = 0.0
+                route_source = "heuristic_fallback"
+        self._render_event(
+            f"Route selected: {route} ({route_source}, confidence={confidence:.2f})",
+            style="blue",
+        )
+        self._debug_route(route, confidence, route_source)
 
         if route == "chat":
+            self._render_event("Active agent: chat", style="cyan")
             response, already_rendered = self._generate_response(
                 user_prompt,
                 context=context,
                 stream=stream,
             )
             responder = "OmniDex"
+            tools_used: list[str] = []
         else:
             agent = self.agents[route]
+            self._render_event(f"Active agent: {agent.name}", style="cyan")
             self._render_event(f"Delegating to agent: {agent.name}", style="cyan")
             with self.console.status(
                 f"[bold cyan]{agent.name} is working...[/bold cyan]",
@@ -126,21 +133,33 @@ class OrchestratorAgent:
                 response = agent.safe_run(user_prompt, context=context)
             already_rendered = False
             responder = agent.name
+            tools_used = list(agent.last_used_tools)
 
         self.memory.add_interaction("user", user_prompt)
         self.memory.add_interaction("assistant", response)
         self.memory.extract_and_store(user_prompt, response)
+        self._render_event(
+            f"Tools used: {', '.join(tools_used) if tools_used else 'none'}",
+            style="yellow",
+        )
         self._render_event(f"Response source: {responder}", style="green")
         if not already_rendered:
             self._render_response(response, title=responder)
         return response
 
-    def _llm_route(self, user_input: str, context: str) -> str:
+    def _route(self, user_input: str, context: str) -> tuple[str, float, str]:
+        """Route with LLM classification first, then fall back to heuristics."""
+        route, confidence = self._llm_route(user_input, context)
+        if confidence >= 0.75:
+            return route, confidence, "llm"
+        return self._heuristic_route(user_input), confidence, "heuristic_fallback"
+
+    def _llm_route(self, user_input: str, context: str) -> tuple[str, float]:
         """Ask the local model to choose a route and normalize the result."""
         routing_input = user_input.strip()
         if context.strip():
             routing_input = (
-                f"Context:\n{context.strip()}\n\n"
+                f"Context:\n{self._bounded_context(context, limit=1200)}\n\n"
                 f"User input:\n{routing_input}"
             )
 
@@ -151,16 +170,39 @@ class OrchestratorAgent:
         completion = self.model.complete(messages, stream=False)
         choice = completion["choices"][0]
         output = choice["message"]["content"].strip().lower()
-        if "research" in output:
+        normalized_output = " ".join(output.split())
+        if normalized_output == "research_assistant":
+            return "research_assistant", 1.0
+        if normalized_output == "chat":
+            return "chat", 1.0
+        if "research" in output and "chat" not in output:
+            return "research_assistant", 0.8
+        if "chat" in output and "research" not in output:
+            return "chat", 0.8
+        return "chat", 0.0
+
+    def _heuristic_route(self, user_input: str) -> str:
+        """Route deterministically when the LLM output is low-confidence."""
+        normalized = user_input.lower()
+        if (
+            "research" in normalized
+            or "summarize" in normalized
+            or ".pdf" in normalized
+            or "document" in normalized
+            or "keyword" in normalized
+            or "analy" in normalized
+        ):
             return "research_assistant"
-        if "chat" in output:
-            return "chat"
         return "chat"
 
-    def _debug_route(self, route: str) -> None:
+    def _debug_route(self, route: str, confidence: float, source: str) -> None:
         """Print a dim route trace when verbose logging is enabled."""
         if self.settings.verbose:
-            self.console.print(f"[dim]Route selected:[/dim] {route}")
+            trace = Text("Route selected: ", style="dim")
+            trace.append(route, style="bold dim")
+            trace.append(" ", style="dim")
+            trace.append(f"(source={source}, confidence={confidence:.2f})", style="dim")
+            self.console.print(trace)
 
     def _generate_response(
         self,
@@ -236,36 +278,36 @@ class OrchestratorAgent:
 
     def _render_banner(self) -> None:
         """Show the session banner."""
-        lines = Group(
-            Text("OmniDex Orchestrator", style="bold white"),
-            Text("Local GGUF runtime via llama-cpp-python", style="cyan"),
-            Text(str(self.settings.model_path), style="dim"),
+        self.console.print(Text("OmniDex Orchestrator", style="bold white"))
+        self.console.print(
+            Text("Local GGUF runtime via llama-cpp-python", style="cyan")
         )
-        self.console.print(Panel(lines, border_style="blue"))
+        self.console.print(Text(str(self.settings.model_path), style="dim"))
+        self.console.print()
 
     def _render_help(self) -> None:
         """Show interactive help."""
-        self.console.print(
-            Panel(
-                "/help  show commands\n"
-                "/clear reset the conversation\n"
-                "/exit  leave the session",
-                title="Commands",
-                border_style="green",
-            )
-        )
+        self.console.print(Text("Commands:", style="bold green"))
+        self.console.print(Text("/help  show commands", style="green"))
+        self.console.print(Text("/clear reset the conversation", style="green"))
+        self.console.print(Text("/exit  leave the session", style="green"))
+        self.console.print()
 
     def _render_event(self, message: str, *, style: str = "cyan") -> None:
         """Render a standard orchestrator event line."""
-        title = Text("orchestrator", style=f"bold {style}")
-        body = Text(message)
-        self.console.print(
-            Panel.fit(body, title=title, border_style=style, padding=(0, 1))
-        )
+        speaker = Text("orchestrator: ", style=f"bold {style}")
+        speaker.append(message)
+        self.console.print(speaker)
 
     def _render_response(self, response: str, *, title: str = "OmniDex") -> None:
         """Render the assistant response."""
-        self.console.print(self._assistant_panel(response, title=title))
+        self.console.print(Text(f"{title}:", style="bold magenta"))
+        body = (
+            Markdown(response or " ")
+            if self.settings.render_markdown
+            else Text(response or " ")
+        )
+        self.console.print(body)
 
     def _assistant_panel(
         self,
@@ -273,25 +315,23 @@ class OrchestratorAgent:
         *,
         status: str | None = None,
         title: str = "OmniDex",
-    ) -> Panel:
+    ):
         """Build the assistant panel for plain text or Markdown output."""
         if status and not response:
-            body = Group(
+            return Group(
                 Spinner("dots", text=status, style="magenta"),
                 Text(" ", style="dim"),
             )
-        else:
-            body = (
-                Markdown(response or " ")
-                if self.settings.render_markdown
-                else Text(response or " ")
-            )
-        return Panel(body, title=title, border_style="magenta")
+        return (
+            Markdown(response or " ")
+            if self.settings.render_markdown
+            else Text(response or " ")
+        )
 
     def _build_messages(self, user_prompt: str, context: str) -> list[dict[str, str]]:
         """Construct the message list sent to the LLM."""
         system_content = self.system_prompt.strip()
-        memory_context = context.strip()
+        memory_context = self._bounded_context(context)
         if memory_context:
             system_content = (
                 f"{system_content}\n\n"
@@ -304,6 +344,13 @@ class OrchestratorAgent:
             {"role": "system", "content": system_content},
             {"role": "user", "content": user_prompt},
         ]
+
+    def _bounded_context(self, context: str, *, limit: int = 2500) -> str:
+        """Trim memory context to a safe length for local model prompts."""
+        normalized = context.strip()
+        if len(normalized) <= limit:
+            return normalized
+        return f"{normalized[:limit].rstrip()}\n\n[Context truncated]"
 
     def _memory_path(self) -> Path:
         """Resolve the persistent long-term memory location."""

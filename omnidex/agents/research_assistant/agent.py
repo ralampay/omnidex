@@ -6,7 +6,9 @@ import re
 
 from omnidex.agents.base import BaseAgent
 from omnidex.runtime import LocalChatModel, LocalLLMSettings
+from omnidex.tools.create_output import CreateOutputTool
 from omnidex.tools.pdf_reader import PDFReaderTool
+from omnidex.tools.report_insights import ReportInsightsTool
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -25,7 +27,9 @@ class ResearchAssistant(BaseAgent):
 
     def __init__(self, *, tools: list[object] | None = None, **kwargs) -> None:
         """Initialize the agent and its local GGUF-backed chat model."""
-        resolved_tools = list(tools or [PDFReaderTool()])
+        resolved_tools = list(
+            tools or [PDFReaderTool(), ReportInsightsTool(), CreateOutputTool()]
+        )
         super().__init__(tools=resolved_tools, **kwargs)
         self.settings = LocalLLMSettings.from_env(
             system_prompt=DEFAULT_SYSTEM_PROMPT
@@ -139,58 +143,163 @@ class ResearchAssistant(BaseAgent):
             return None
         return match.group("path").strip("\"'")
 
-    def _route_tool_request(self, query: str) -> dict[str, str] | None:
-        """Choose a tool and action for the query using simple heuristics."""
+    def _route_tool_plan(self, query: str) -> list[dict[str, str]]:
+        """Choose a multi-step tool plan for the query using simple heuristics."""
         normalized_query = query.strip()
         lowered_query = normalized_query.lower()
         pdf_path = self._find_pdf_path(normalized_query)
         pdf_reader = self.get_tool("pdf_reader")
+        report_insights = self.get_tool("report_insights")
+        create_output = self.get_tool("create_output")
 
-        strategies = [
-            {
-                "tool_name": "pdf_reader",
-                "mode": "summarize",
-                "file_path": self._extract_pdf_path(normalized_query),
-                "reason": "explicit summarize pdf command",
-                "matched": bool(pdf_reader) and lowered_query.startswith("summarize pdf:"),
-            },
-            {
-                "tool_name": "pdf_reader",
-                "mode": "summarize",
-                "file_path": pdf_path or "",
-                "reason": "bare PDF path detected",
-                "matched": bool(pdf_reader)
-                and bool(pdf_path)
-                and normalized_query.strip("\"'").lower() == (pdf_path or "").lower(),
-            },
-            {
-                "tool_name": "pdf_reader",
-                "mode": "question_answer",
-                "file_path": pdf_path or "",
-                "reason": "query references a PDF document",
-                "matched": bool(pdf_reader) and bool(pdf_path),
-            },
-        ]
+        wants_summary = (
+            lowered_query.startswith("summarize pdf:")
+            or ("summarize" in lowered_query and bool(pdf_path))
+            or normalized_query.strip("\"'").lower() == (pdf_path or "").lower()
+        )
+        wants_insights = any(
+            keyword in lowered_query
+            for keyword in {"insight", "keywords", "strength", "novel", "gap", "limitation"}
+        )
 
-        for strategy in strategies:
-            if strategy["matched"]:
-                return {
-                    "tool_name": str(strategy["tool_name"]),
-                    "mode": str(strategy["mode"]),
-                    "file_path": str(strategy["file_path"]),
-                    "reason": str(strategy["reason"]),
+        if bool(pdf_reader) and bool(pdf_path) and wants_insights:
+            plan = [
+                {
+                    "tool_name": "pdf_reader",
+                    "mode": "read",
+                    "file_path": pdf_path or self._extract_pdf_path(normalized_query),
+                    "reason": "load PDF content for downstream processing",
                 }
-        return None
+            ]
+            if bool(report_insights):
+                plan.append(
+                    {
+                        "tool_name": "report_insights",
+                        "mode": "insights",
+                        "reason": "generate structured report insights",
+                    }
+                )
+            if bool(create_output):
+                plan.append(
+                    {
+                        "tool_name": "create_output",
+                        "mode": "finalize",
+                        "title": "Report Insights",
+                        "reason": "final response formatting",
+                    }
+                )
+            return plan
+
+        if bool(pdf_reader) and bool(pdf_path) and wants_summary:
+            plan = [
+                {
+                    "tool_name": "pdf_reader",
+                    "mode": "read",
+                    "file_path": pdf_path or self._extract_pdf_path(normalized_query),
+                    "reason": "load PDF content for summarization",
+                }
+            ]
+            if bool(create_output):
+                plan.append(
+                    {
+                        "tool_name": "create_output",
+                        "mode": "finalize",
+                        "title": "PDF Summary",
+                        "reason": "final response formatting",
+                    }
+                )
+            return plan
+
+        if bool(pdf_reader) and bool(pdf_path):
+            plan = [
+                {
+                    "tool_name": "pdf_reader",
+                    "mode": "question_answer",
+                    "file_path": pdf_path,
+                    "reason": "query references a PDF document",
+                }
+            ]
+            if bool(create_output):
+                plan.append(
+                    {
+                        "tool_name": "create_output",
+                        "mode": "finalize",
+                        "reason": "final response formatting",
+                    }
+                )
+            return plan
+
+        return []
+
+    def _extract_keywords(self, text: str, *, limit: int = 5) -> list[str]:
+        """Extract simple frequent keywords from document text."""
+        stop_words = {
+            "the", "and", "for", "with", "that", "this", "from", "about", "into",
+            "their", "there", "have", "using", "used", "such", "than", "then",
+            "they", "them", "were", "been", "also", "can", "could", "would",
+        }
+        counts: dict[str, int] = {}
+        for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", text.lower()):
+            if token in stop_words:
+                continue
+            counts[token] = counts.get(token, 0) + 1
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return [keyword for keyword, _ in ranked[:limit]]
+
+    def _extract_title(self, text: str) -> str:
+        """Extract a best-effort document title from the first non-empty line."""
+        for line in text.splitlines():
+            normalized = line.strip()
+            if normalized:
+                return normalized[:120]
+        return "Untitled Report"
+
+    def _generate_report_insights(self, text: str) -> str:
+        """Generate structured report insights and format them via the tool."""
+        tool = self.get_tool("report_insights")
+        if tool is None:
+            return text.strip()
+
+        summary = self._summarize_pdf_text(text)
+        strengths = [
+            sentence.strip(" -.")
+            for sentence in re.split(r"[.\n]+", summary)
+            if sentence.strip()
+        ][:3]
+        gaps = [
+            "Potential limitations were not explicitly identified in the available summary.",
+        ]
+        novel_approach = (
+            strengths[0]
+            if strengths
+            else "No clearly novel approach was identified from the extracted text."
+        )
+        return tool.run(
+            title=self._extract_title(text),
+            keywords=self._extract_keywords(text),
+            strengths=strengths,
+            novel_approach=novel_approach,
+            gaps_and_limitations=gaps,
+        )
+
+    def _finalize_output(self, content: str, *, title: str | None = None) -> str:
+        """Send the response through the output tool when available."""
+        tool = self.get_tool("create_output")
+        if tool is None:
+            return content.strip()
+        self.record_tool_use(tool.name, reason="final response formatting")
+        return tool.run(content, title=title)
 
     def _build_system_prompt(self, context: str = "", pdf_text: str = "") -> str:
         """Build the system prompt with optional memory and PDF context."""
         system_prompt = self.settings.system_prompt.strip()
-        if context.strip():
+        bounded_context = self._truncate_text(context, limit=1800)
+        if bounded_context:
             system_prompt = (
                 f"{system_prompt}\n\n"
                 "Use the context below if relevant. Do not repeat it verbatim "
                 "unless the user asks.\n\n"
-                f"{context.strip()}"
+                f"{bounded_context}"
             )
         if pdf_text.strip():
             system_prompt = (
@@ -245,40 +354,64 @@ class ResearchAssistant(BaseAgent):
             return chunks[0][:budget].strip()
         return "\n\n---\n\n".join(selected)
 
+    def _truncate_text(self, text: str, *, limit: int) -> str:
+        """Trim arbitrary context to a bounded size for local prompts."""
+        normalized = text.strip()
+        if len(normalized) <= limit:
+            return normalized
+        return f"{normalized[:limit].rstrip()}\n\n[Context truncated]"
+
     def run(self, query: str, context: str = "") -> str:
         """Answer a research query using the local chat model."""
         self.log(f"Running research query: {query}")
 
         pdf_text = ""
-        tool_request = self._route_tool_request(query)
-        if tool_request is not None:
-            tool = self.get_tool(tool_request["tool_name"])
-            if tool is not None:
-                self.emit(
-                    f"Using tool: {tool.name} ({tool_request['reason']})",
-                    style="yellow",
-                )
-                self.log(
-                    f"Tool route selected: {tool_request['tool_name']} "
-                    f"mode={tool_request['mode']} path={tool_request['file_path']}"
-                )
-                pdf_text = tool.run(tool_request["file_path"])
-            else:
-                self.emit(
-                    f"Tool unavailable: {tool_request['tool_name']}",
-                    style="red",
-                )
-                pdf_text = ""
+        tool_plan = self._route_tool_plan(query)
+        if tool_plan:
+            plan_names = " -> ".join(step["tool_name"] for step in tool_plan)
+            self.emit(f"Tool plan: {plan_names}", style="yellow")
 
-            if pdf_text.startswith("Error:") or pdf_text.startswith("Warning:"):
-                return pdf_text
-            if tool_request["mode"] == "summarize":
-                return self._summarize_pdf_text(pdf_text)
-            pdf_text = self._select_relevant_pdf_context(pdf_text, query)
-            self.log(
-                f"Selected {len(pdf_text)} characters of PDF context "
-                f"within a {self._input_char_budget()} character budget."
-            )
+            final_output = ""
+            for step in tool_plan:
+                tool = self.get_tool(step["tool_name"])
+                if tool is None:
+                    self.emit(f"Tool unavailable: {step['tool_name']}", style="red")
+                    continue
+
+                self.record_tool_use(tool.name, reason=step["reason"])
+                self.log(
+                    f"Tool step selected: {step['tool_name']} "
+                    f"mode={step['mode']}"
+                )
+
+                if step["tool_name"] == "pdf_reader":
+                    pdf_text = tool.run(step["file_path"])
+                    if pdf_text.startswith("Error:") or pdf_text.startswith("Warning:"):
+                        return pdf_text
+                elif step["tool_name"] == "report_insights":
+                    final_output = self._generate_report_insights(pdf_text)
+                elif step["tool_name"] == "create_output":
+                    content = final_output or self._summarize_pdf_text(pdf_text)
+                    final_output = tool.run(content, title=step.get("title"))
+
+            if final_output:
+                return final_output
+            if pdf_text:
+                return self._finalize_output(self._summarize_pdf_text(pdf_text), title="PDF Summary")
+
+        pdf_path = self._find_pdf_path(query)
+        if pdf_path:
+            pdf_tool = self.get_tool("pdf_reader")
+            if pdf_tool is not None:
+                self.record_tool_use(pdf_tool.name, reason="query references a PDF document")
+                pdf_text = pdf_tool.run(pdf_path)
+                if pdf_text.startswith("Error:") or pdf_text.startswith("Warning:"):
+                    return pdf_text
+                pdf_text = self._select_relevant_pdf_context(pdf_text, query)
+                self.log(
+                    f"Selected {len(pdf_text)} characters of PDF context "
+                    f"within a {self._input_char_budget()} character budget."
+                )
 
         system_prompt = self._build_system_prompt(context=context, pdf_text=pdf_text)
 
@@ -290,4 +423,4 @@ class ResearchAssistant(BaseAgent):
         response = completion["choices"][0]["message"]["content"]
         cleaned = response.strip()
         self.log("Research query completed.")
-        return cleaned
+        return self._finalize_output(cleaned)

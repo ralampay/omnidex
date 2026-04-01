@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext, redirect_stderr
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from tempfile import TemporaryFile
 from typing import Iterable
 
 from llama_cpp import Llama
@@ -119,14 +121,14 @@ class LocalChatModel:
             raise FileNotFoundError(
                 f"Configured model does not exist: {settings.model_path}"
             )
-
-        self._llm = Llama(
-            model_path=str(settings.model_path),
-            n_ctx=settings.ctx_size,
-            n_threads=settings.threads,
-            n_gpu_layers=settings.gpu_layers,
-            verbose=settings.verbose,
-        )
+        with self._suppress_llama_stderr():
+            self._llm = Llama(
+                model_path=str(settings.model_path),
+                n_ctx=settings.ctx_size,
+                n_threads=settings.threads,
+                n_gpu_layers=settings.gpu_layers,
+                verbose=settings.verbose,
+            )
 
     def complete(
         self,
@@ -143,3 +145,10 @@ class LocalChatModel:
             max_tokens=self.settings.max_tokens,
             stream=should_stream,
         )
+
+    def _suppress_llama_stderr(self):
+        """Suppress llama.cpp stderr noise unless verbose logging is enabled."""
+        if self.settings.verbose:
+            return nullcontext()
+        sink = TemporaryFile(mode="w+")
+        return redirect_stderr(sink)

@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from rich.console import Console
-from rich.panel import Panel
 from rich.text import Text
 
 
@@ -28,6 +27,7 @@ class BaseAgent:
         self.verbose = verbose
         self.console = console or Console()
         self.tools = list(tools or [])
+        self.last_used_tools: list[str] = []
 
     def run(self, query: str, context: str = "") -> str:
         """Execute the agent's core task for the given query and context."""
@@ -39,6 +39,7 @@ class BaseAgent:
 
     def before_run(self, query: str, context: str) -> None:
         """Hook called before agent execution."""
+        self.last_used_tools = []
         self.emit("Starting task.", style="cyan")
 
     def after_run(self, query: str, response: str) -> None:
@@ -58,11 +59,9 @@ class BaseAgent:
 
     def emit(self, message: str, *, style: str = "cyan") -> None:
         """Print a standard agent event line."""
-        title = Text(self.name, style=f"bold {style}")
-        body = Text(message)
-        self.console.print(
-            Panel.fit(body, title=title, border_style=style, padding=(0, 1))
-        )
+        speaker = Text(f"{self.name}: ", style=f"bold {style}")
+        speaker.append(message)
+        self.console.print(speaker)
 
     def get_tool(self, name: str) -> Any | None:
         """Return a tool by name from the agent's registered tool list."""
@@ -70,6 +69,14 @@ class BaseAgent:
             if getattr(tool, "name", None) == name:
                 return tool
         return None
+
+    def record_tool_use(self, tool_name: str, *, reason: str = "") -> None:
+        """Record and announce a tool usage event."""
+        self.last_used_tools.append(tool_name)
+        if reason:
+            self.emit(f"Using tool: {tool_name} ({reason})", style="yellow")
+        else:
+            self.emit(f"Using tool: {tool_name}", style="yellow")
 
     def log(self, message: str) -> None:
         """Print a verbose debug message when enabled."""
