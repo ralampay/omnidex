@@ -2,6 +2,10 @@
 
 A lightweight Python CLI for running local agents.
 
+## Documentation
+
+- [Docs Index](docs/README.md)
+
 ## Setup
 
 ```bash
