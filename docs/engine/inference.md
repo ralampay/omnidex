@@ -78,7 +78,7 @@ defined in `omnidex/runtime.py`.
 - initialize `llama_cpp.Llama` with the resolved inference settings
 - suppress llama.cpp stderr noise unless verbose mode is enabled
 - submit chat-format messages for completion
-- return the raw llama-cpp response object or stream iterator
+- expose both raw and normalized text inference APIs
 
 ### What It Does Not Do
 
@@ -89,7 +89,7 @@ defined in `omnidex/runtime.py`.
 - choosing tools
 - extracting PDF text
 - formatting the final answer
-- interpreting the response beyond returning llama-cpp output
+- owning prompt design or business logic
 
 Those responsibilities belong to the agent that owns the model instance.
 
@@ -117,7 +117,24 @@ Llama(
 
 ### Inference Call Contract
 
-The core inference method is:
+`LocalChatModel` exposes two inference methods:
+
+```python
+complete(messages, stream=None)
+generate_text(messages, stream=None)
+```
+
+Use them this way:
+
+- `complete(...)`: low-level access to the raw llama.cpp completion object or stream iterator
+- `generate_text(...)`: high-level helper that returns final assistant text directly
+
+The default application-facing method should be `generate_text(...)` when the
+caller only needs content.
+
+### Raw Completion API
+
+The low-level method is:
 
 ```python
 complete(messages, stream=None)
@@ -141,9 +158,23 @@ self._llm.create_chat_completion(
 )
 ```
 
+### Text Generation API
+
+The high-level method is:
+
+```python
+generate_text(messages, stream=None)
+```
+
+`generate_text(...)` calls `complete(...)` internally and normalizes the output:
+
+- non-streaming mode extracts `choices[0]["message"]["content"]`
+- streaming mode collects `choices[0]["delta"]["content"]` chunks and joins them
+- both paths return a final stripped `str`
+
 ### Streaming Behavior
 
-- if `stream` is passed explicitly to `complete(...)`, that value is used
+- if `stream` is passed explicitly to either inference method, that value is used
 - otherwise `settings.stream` is used
 
 Return shape:
@@ -151,16 +182,22 @@ Return shape:
 - non-streaming mode returns a completion dictionary
 - streaming mode returns an iterator of event chunks
 
-Typical non-stream extraction:
+Typical raw non-stream extraction:
 
 ```python
 text = completion["choices"][0]["message"]["content"].strip()
 ```
 
-Typical streaming extraction:
+Typical raw streaming extraction:
 
 ```python
 piece = event["choices"][0].get("delta", {}).get("content")
+```
+
+Typical text-first call:
+
+```python
+text = model.generate_text(messages, stream=False)
 ```
 
 ## How Inference Works End to End
@@ -171,9 +208,9 @@ The inference lifecycle is:
 2. The agent creates `LocalLLMSettings.from_env(system_prompt=...)`.
 3. The agent creates `LocalChatModel(settings)`.
 4. The agent builds a `messages` list for the task.
-5. The agent calls `model.complete(messages, stream=...)`.
-6. llama.cpp returns either a completion object or streaming events.
-7. The agent extracts text from the response and decides what to do next.
+5. The agent usually calls `model.generate_text(messages, stream=...)`.
+6. `LocalChatModel` either extracts message content or collects streamed deltas.
+7. The agent receives final text and decides what to do next.
 
 This means the behavior of inference is shaped by the agent's prompt assembly,
 not by `LocalChatModel` alone.
@@ -213,8 +250,7 @@ messages = [
     {"role": "user", "content": "Say hello in one sentence."},
 ]
 
-completion = model.complete(messages, stream=False)
-text = completion["choices"][0]["message"]["content"].strip()
+text = model.generate_text(messages, stream=False)
 
 print(text)
 ```

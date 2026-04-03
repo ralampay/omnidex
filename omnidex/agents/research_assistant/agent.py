@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+import json
 import re
 
 from omnidex.agents.base import BaseAgent
@@ -65,9 +67,7 @@ class ResearchAssistant(BaseAgent):
             },
             {"role": "user", "content": chunk},
         ]
-        completion = self.model.complete(messages, stream=False)
-        response = completion["choices"][0]["message"]["content"]
-        return response.strip()
+        return self.model.generate_text(messages, stream=False)
 
     def _summarize_pdf_text(self, text: str) -> str:
         """Summarize long PDF text by chunking, then refining the result."""
@@ -120,9 +120,7 @@ class ResearchAssistant(BaseAgent):
             },
             {"role": "user", "content": "\n\n".join(summaries)},
         ]
-        completion = self.model.complete(messages, stream=False)
-        response = completion["choices"][0]["message"]["content"]
-        return response.strip()
+        return self.model.generate_text(messages, stream=False)
 
     def _extract_pdf_path(self, query: str) -> str:
         """Resolve a PDF path from supported query forms."""
@@ -143,93 +141,184 @@ class ResearchAssistant(BaseAgent):
             return None
         return match.group("path").strip("\"'")
 
-    def _route_tool_plan(self, query: str) -> list[dict[str, str]]:
-        """Choose a multi-step tool plan for the query using simple heuristics."""
-        normalized_query = query.strip()
-        lowered_query = normalized_query.lower()
-        pdf_path = self._find_pdf_path(normalized_query)
-        pdf_reader = self.get_tool("pdf_reader")
-        report_insights = self.get_tool("report_insights")
-        create_output = self.get_tool("create_output")
+    def _describe_tools(self) -> list[dict[str, object]]:
+        """Return structured tool metadata for LLM planning."""
+        described_tools: list[dict[str, object]] = []
+        for tool in self.tools:
+            tool_name = getattr(tool, "name", tool.__class__.__name__)
+            description = (
+                getattr(tool, "__doc__", None)
+                or getattr(tool.run, "__doc__", None)
+                or "Tool available for agent workflows."
+            )
+            normalized_description = " ".join(description.strip().split())
 
-        wants_summary = (
-            lowered_query.startswith("summarize pdf:")
-            or ("summarize" in lowered_query and bool(pdf_path))
-            or normalized_query.strip("\"'").lower() == (pdf_path or "").lower()
-        )
-        wants_insights = any(
-            keyword in lowered_query
-            for keyword in {"insight", "keywords", "strength", "novel", "gap", "limitation"}
-        )
+            expected_inputs: list[str] = []
+            try:
+                signature = inspect.signature(tool.run)
+            except (TypeError, ValueError):
+                signature = None
 
-        if bool(pdf_reader) and bool(pdf_path) and wants_insights:
-            plan = [
+            if signature is not None:
+                for parameter in signature.parameters.values():
+                    if parameter.name == "self":
+                        continue
+                    if parameter.kind in {
+                        inspect.Parameter.VAR_POSITIONAL,
+                        inspect.Parameter.VAR_KEYWORD,
+                    }:
+                        continue
+                    expected_inputs.append(parameter.name)
+
+            described_tools.append(
                 {
-                    "tool_name": "pdf_reader",
-                    "mode": "read",
-                    "file_path": pdf_path or self._extract_pdf_path(normalized_query),
-                    "reason": "load PDF content for downstream processing",
+                    "name": tool_name,
+                    "description": normalized_description,
+                    "inputs": expected_inputs or ["generic_input"],
                 }
-            ]
-            if bool(report_insights):
-                plan.append(
-                    {
-                        "tool_name": "report_insights",
-                        "mode": "insights",
-                        "reason": "generate structured report insights",
-                    }
-                )
-            if bool(create_output):
-                plan.append(
-                    {
-                        "tool_name": "create_output",
-                        "mode": "finalize",
-                        "title": "Report Insights",
-                        "reason": "final response formatting",
-                    }
-                )
-            return plan
+            )
 
-        if bool(pdf_reader) and bool(pdf_path) and wants_summary:
-            plan = [
+        return described_tools
+
+    def _generate_plan(self, query: str) -> list[dict]:
+        """Use the local model to generate a structured tool plan."""
+        tool_descriptions = self._describe_tools()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert AI planning agent.\n\n"
+                    "Your job is to:\n"
+                    "- Analyze the user query\n"
+                    "- Break it into steps\n"
+                    "- Decide which tools to use\n"
+                    "- Produce a structured execution plan\n\n"
+                    "You must:\n"
+                    "- Only use available tools\n"
+                    "- Be concise and logical\n"
+                    "- Avoid hallucinating tools\n"
+                    "- Return ONLY valid JSON\n"
+                    "- Use an empty plan when no tool is needed"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User Query:\n{query.strip()}\n\n"
+                    f"Available Tools:\n{json.dumps(tool_descriptions, indent=2)}\n\n"
+                    "---\n\n"
+                    "Return ONLY valid JSON in this format:\n\n"
+                    "{\n"
+                    '  "plan": [\n'
+                    "    {\n"
+                    '      "step": 1,\n'
+                    '      "tool_name": "tool_name_here",\n'
+                    '      "mode": "optional_mode",\n'
+                    '      "inputs": { "param": "value" },\n'
+                    '      "reason": "why this step is needed"\n'
+                    "    }\n"
+                    "  ]\n"
+                    "}"
+                ),
+            },
+        ]
+
+        try:
+            raw_content = self.model.generate_text(messages, stream=False)
+        except Exception as exc:
+            self.emit(f"Plan generation failed: {exc}", style="yellow")
+            return []
+
+        cleaned_content = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            raw_content,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+
+        try:
+            payload = json.loads(cleaned_content)
+        except json.JSONDecodeError as exc:
+            json_start = cleaned_content.find("{")
+            json_end = cleaned_content.rfind("}")
+            if json_start == -1 or json_end == -1 or json_end <= json_start:
+                self.emit(f"Plan parsing failed: {exc}", style="yellow")
+                self.log(f"Raw plan output: {raw_content}")
+                return []
+            try:
+                payload = json.loads(cleaned_content[json_start:json_end + 1])
+            except json.JSONDecodeError as nested_exc:
+                self.emit(f"Plan parsing failed: {nested_exc}", style="yellow")
+                self.log(f"Raw plan output: {raw_content}")
+                return []
+
+        raw_plan = payload.get("plan", [])
+        if not isinstance(raw_plan, list):
+            self.emit("Plan parsing failed: plan must be a list.", style="yellow")
+            return []
+
+        normalized_plan: list[dict] = []
+        for index, step in enumerate(raw_plan, start=1):
+            if not isinstance(step, dict):
+                self.emit(f"Skipping invalid plan step at position {index}.", style="yellow")
+                continue
+
+            tool_name = str(step.get("tool_name", "")).strip()
+            mode = step.get("mode")
+            inputs = step.get("inputs", {})
+            reason = str(step.get("reason", "")).strip()
+
+            if not tool_name:
+                self.emit(f"Skipping plan step {index}: missing tool_name.", style="yellow")
+                continue
+            if not isinstance(inputs, dict):
+                self.emit(f"Skipping plan step {index}: inputs must be an object.", style="yellow")
+                continue
+
+            normalized_plan.append(
                 {
-                    "tool_name": "pdf_reader",
-                    "mode": "read",
-                    "file_path": pdf_path or self._extract_pdf_path(normalized_query),
-                    "reason": "load PDF content for summarization",
+                    "step": step.get("step", index),
+                    "tool_name": tool_name,
+                    "mode": str(mode).strip() if mode is not None else "",
+                    "inputs": inputs,
+                    "reason": reason or "No reason provided.",
                 }
-            ]
-            if bool(create_output):
-                plan.append(
-                    {
-                        "tool_name": "create_output",
-                        "mode": "finalize",
-                        "title": "PDF Summary",
-                        "reason": "final response formatting",
-                    }
-                )
-            return plan
+            )
 
-        if bool(pdf_reader) and bool(pdf_path):
-            plan = [
-                {
-                    "tool_name": "pdf_reader",
-                    "mode": "question_answer",
-                    "file_path": pdf_path,
-                    "reason": "query references a PDF document",
-                }
-            ]
-            if bool(create_output):
-                plan.append(
-                    {
-                        "tool_name": "create_output",
-                        "mode": "finalize",
-                        "reason": "final response formatting",
-                    }
-                )
-            return plan
+        self.emit(f"Generated Plan: {normalized_plan}", style="cyan")
+        return normalized_plan
 
-        return []
+    def _missing_required_inputs(
+        self,
+        tool: object,
+        inputs: dict[str, object],
+        *,
+        derived_inputs: set[str] | None = None,
+    ) -> list[str]:
+        """Return required tool inputs that are missing from the plan step."""
+        try:
+            signature = inspect.signature(tool.run)
+        except (TypeError, ValueError):
+            return []
+
+        available_inputs = set(inputs)
+        if derived_inputs:
+            available_inputs.update(derived_inputs)
+
+        missing: list[str] = []
+        for parameter in signature.parameters.values():
+            if parameter.name == "self":
+                continue
+            if parameter.kind in {
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }:
+                continue
+            if parameter.default is not inspect._empty:
+                continue
+            if parameter.name not in available_inputs:
+                missing.append(parameter.name)
+        return missing
 
     def _extract_keywords(self, text: str, *, limit: int = 5) -> list[str]:
         """Extract simple frequent keywords from document text."""
@@ -366,33 +455,80 @@ class ResearchAssistant(BaseAgent):
         self.log(f"Running research query: {query}")
 
         pdf_text = ""
-        tool_plan = self._route_tool_plan(query)
+        tool_plan = self._generate_plan(query)
         if tool_plan:
             plan_names = " -> ".join(step["tool_name"] for step in tool_plan)
             self.emit(f"Tool plan: {plan_names}", style="yellow")
 
             final_output = ""
             for step in tool_plan:
-                tool = self.get_tool(step["tool_name"])
+                tool_name = str(step.get("tool_name", "")).strip()
+                mode = str(step.get("mode", "")).strip()
+                inputs = step.get("inputs", {})
+
+                if not tool_name:
+                    self.emit("Skipping invalid step with missing tool_name.", style="yellow")
+                    continue
+                if not isinstance(inputs, dict):
+                    self.emit(f"Skipping invalid step for {tool_name}: inputs must be a dict.", style="yellow")
+                    continue
+
+                tool = self.get_tool(tool_name)
                 if tool is None:
-                    self.emit(f"Tool unavailable: {step['tool_name']}", style="red")
+                    self.emit(f"Tool unavailable: {tool_name}", style="red")
+                    continue
+
+                derived_inputs: set[str] = set()
+                if tool_name == "report_insights":
+                    derived_inputs = {
+                        "title",
+                        "keywords",
+                        "strengths",
+                        "novel_approach",
+                        "gaps_and_limitations",
+                    }
+                elif tool_name == "create_output":
+                    derived_inputs = {"content"}
+
+                missing_inputs = self._missing_required_inputs(
+                    tool,
+                    inputs,
+                    derived_inputs=derived_inputs,
+                )
+                if missing_inputs:
+                    self.emit(
+                        f"Skipping {tool_name} step: missing required inputs "
+                        f"{', '.join(missing_inputs)}.",
+                        style="yellow",
+                    )
                     continue
 
                 self.record_tool_use(tool.name, reason=step["reason"])
                 self.log(
-                    f"Tool step selected: {step['tool_name']} "
-                    f"mode={step['mode']}"
+                    f"Tool step selected: {tool_name} "
+                    f"mode={mode}"
                 )
 
-                if step["tool_name"] == "pdf_reader":
-                    pdf_text = tool.run(step["file_path"])
+                if tool_name == "pdf_reader":
+                    file_path = str(inputs.get("file_path", "")).strip()
+                    if not file_path:
+                        self.emit("Skipping pdf_reader step: missing file_path input.", style="yellow")
+                        continue
+                    pdf_text = tool.run(file_path)
                     if pdf_text.startswith("Error:") or pdf_text.startswith("Warning:"):
                         return pdf_text
-                elif step["tool_name"] == "report_insights":
+                elif tool_name == "report_insights":
+                    if not pdf_text.strip():
+                        self.emit("Skipping report_insights step: no PDF content available.", style="yellow")
+                        continue
                     final_output = self._generate_report_insights(pdf_text)
-                elif step["tool_name"] == "create_output":
+                elif tool_name == "create_output":
+                    if not final_output and not pdf_text.strip():
+                        self.emit("Skipping create_output step: no content available.", style="yellow")
+                        continue
+                    title = str(inputs.get("title", "")).strip() or step.get("title")
                     content = final_output or self._summarize_pdf_text(pdf_text)
-                    final_output = tool.run(content, title=step.get("title"))
+                    final_output = tool.run(content, title=title)
 
             if final_output:
                 return final_output
@@ -419,8 +555,6 @@ class ResearchAssistant(BaseAgent):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": query},
         ]
-        completion = self.model.complete(messages, stream=False)
-        response = completion["choices"][0]["message"]["content"]
-        cleaned = response.strip()
+        cleaned = self.model.generate_text(messages, stream=False)
         self.log("Research query completed.")
         return self._finalize_output(cleaned)

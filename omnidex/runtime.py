@@ -146,6 +146,33 @@ class LocalChatModel:
             stream=should_stream,
         )
 
+    def generate_text(
+        self,
+        messages: Iterable[dict[str, str]],
+        *,
+        stream: bool | None = None,
+    ) -> str:
+        """Return normalized text content from a chat completion."""
+        completion = self.complete(messages, stream=stream)
+        should_stream = self.settings.stream if stream is None else stream
+        if should_stream:
+            return self._collect_stream_text(completion)
+        return self._extract_message_content(completion)
+
+    def _extract_message_content(self, completion: dict) -> str:
+        """Extract assistant text from a non-streaming llama.cpp response."""
+        return completion["choices"][0]["message"]["content"].strip()
+
+    def _collect_stream_text(self, events: Iterable[dict]) -> str:
+        """Collect streamed llama.cpp delta events into one final string."""
+        chunks: list[str] = []
+        for event in events:
+            delta = event["choices"][0].get("delta", {})
+            piece = delta.get("content")
+            if piece:
+                chunks.append(piece)
+        return "".join(chunks).strip()
+
     def _suppress_llama_stderr(self):
         """Suppress llama.cpp stderr noise unless verbose logging is enabled."""
         if self.settings.verbose:

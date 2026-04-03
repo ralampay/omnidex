@@ -167,9 +167,7 @@ class OrchestratorAgent:
             {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
             {"role": "user", "content": routing_input},
         ]
-        completion = self.model.complete(messages, stream=False)
-        choice = completion["choices"][0]
-        output = choice["message"]["content"].strip().lower()
+        output = self.model.generate_text(messages, stream=False).lower()
         normalized_output = " ".join(output.split())
         if normalized_output == "research_assistant":
             return "research_assistant", 1.0
@@ -224,14 +222,12 @@ class OrchestratorAgent:
             "[bold magenta]OmniDex is thinking...[/bold magenta]",
             spinner="dots",
         ):
-            completion = self.model.complete(
+            message = self.model.generate_text(
                 self._build_messages(user_prompt, context),
                 stream=False,
             )
 
-        choice = completion["choices"][0]
-        message = choice["message"]["content"]
-        return message.strip(), False
+        return message, False
 
     def _collect_stream(self, events: Sequence[dict] | object) -> str:
         """Render streaming tokens as they arrive."""
