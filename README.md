@@ -9,6 +9,10 @@ Suggested models that can run locally.
 * [Qwen 3.5 2b](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/tree/main)
 * [Gemma 4 E2b](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/tree/main)
 
+Model support depends on the installed `llama-cpp-python` / `llama.cpp` build.
+If startup fails with `unknown model architecture`, upgrade that runtime or use
+a GGUF architecture your current build already supports.
+
 ## Documentation
 
 - [Docs Index](docs/README.md)

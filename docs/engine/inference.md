@@ -104,6 +104,8 @@ Creating `LocalChatModel(settings)` requires:
 
 If the configured path does not exist, `LocalChatModel` raises a
 `FileNotFoundError`.
+If llama.cpp rejects the GGUF, `LocalChatModel` raises a `ValueError` with the
+captured loader diagnostics instead of only surfacing the generic load failure.
 
 During initialization it constructs:
 

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext, redirect_stderr
+from contextlib import redirect_stderr
 from dataclasses import dataclass
+import importlib.metadata
 import os
 from pathlib import Path
+import re
+import struct
 from tempfile import TemporaryFile
 from typing import Iterable
 
@@ -167,6 +170,82 @@ def resolve_gpu_layers(device: str) -> int:
     return 0
 
 
+def installed_llama_cpp_version() -> str | None:
+    """Return the installed llama-cpp-python version when available."""
+    try:
+        return importlib.metadata.version("llama-cpp-python")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def read_gguf_architecture(model_path: Path) -> str | None:
+    """Read the GGUF ``general.architecture`` metadata when present."""
+
+    def read_exact(handle, size: int) -> bytes:
+        chunk = handle.read(size)
+        if len(chunk) != size:
+            raise ValueError("Unexpected EOF while reading GGUF metadata.")
+        return chunk
+
+    def read_u32(handle) -> int:
+        return struct.unpack("<I", read_exact(handle, 4))[0]
+
+    def read_u64(handle) -> int:
+        return struct.unpack("<Q", read_exact(handle, 8))[0]
+
+    def read_string(handle) -> str:
+        size = read_u64(handle)
+        return read_exact(handle, size).decode("utf-8")
+
+    def skip_value(handle, value_type: int) -> None:
+        fixed_sizes = {
+            0: 1,   # uint8
+            1: 1,   # int8
+            2: 2,   # uint16
+            3: 2,   # int16
+            4: 4,   # uint32
+            5: 4,   # int32
+            6: 4,   # float32
+            7: 1,   # bool
+            10: 8,  # uint64
+            11: 8,  # int64
+            12: 8,  # float64
+        }
+        if value_type == 8:  # string
+            read_string(handle)
+            return
+        if value_type == 9:  # array
+            element_type = read_u32(handle)
+            count = read_u64(handle)
+            for _ in range(count):
+                skip_value(handle, element_type)
+            return
+        size = fixed_sizes.get(value_type)
+        if size is None:
+            raise ValueError(f"Unsupported GGUF metadata value type: {value_type}")
+        read_exact(handle, size)
+
+    with model_path.open("rb") as handle:
+        if read_exact(handle, 4) != b"GGUF":
+            return None
+
+        version = read_u32(handle)
+        if version not in {2, 3}:
+            return None
+
+        _tensor_count = read_u64(handle)
+        metadata_count = read_u64(handle)
+
+        for _ in range(metadata_count):
+            key = read_string(handle)
+            value_type = read_u32(handle)
+            if key == "general.architecture" and value_type == 8:
+                return read_string(handle)
+            skip_value(handle, value_type)
+
+    return None
+
+
 class LocalChatModel:
     """Thin wrapper around llama-cpp chat completion."""
 
@@ -176,14 +255,8 @@ class LocalChatModel:
             raise FileNotFoundError(
                 f"Configured model does not exist: {settings.model_path}"
             )
-        with self._suppress_llama_stderr():
-            self._llm = Llama(
-                model_path=str(settings.model_path),
-                n_ctx=settings.ctx_size,
-                n_threads=settings.threads,
-                n_gpu_layers=settings.gpu_layers,
-                verbose=settings.verbose,
-            )
+        self._preflight_model_compatibility()
+        self._llm = self._load_llm()
 
     def complete(
         self,
@@ -228,9 +301,65 @@ class LocalChatModel:
                 chunks.append(piece)
         return "".join(chunks).strip()
 
-    def _suppress_llama_stderr(self):
-        """Suppress llama.cpp stderr noise unless verbose logging is enabled."""
+    def _load_llm(self) -> Llama:
+        """Initialize llama.cpp and preserve loader diagnostics on failure."""
         if self.settings.verbose:
-            return nullcontext()
-        sink = TemporaryFile(mode="w+")
-        return redirect_stderr(sink)
+            return self._build_llm()
+
+        with TemporaryFile(mode="w+") as sink, redirect_stderr(sink):
+            try:
+                return self._build_llm()
+            except Exception as exc:
+                sink.seek(0)
+                diagnostics = sink.read().strip()
+                raise self._model_load_error(exc, diagnostics) from exc
+
+    def _build_llm(self) -> Llama:
+        """Construct the llama.cpp model instance."""
+        return Llama(
+            model_path=str(self.settings.model_path),
+            n_ctx=self.settings.ctx_size,
+            n_threads=self.settings.threads,
+            n_gpu_layers=self.settings.gpu_layers,
+            verbose=self.settings.verbose,
+        )
+
+    def _model_load_error(self, exc: Exception, diagnostics: str) -> ValueError:
+        """Convert llama.cpp initialization failures into actionable errors."""
+        architecture_match = re.search(
+            r"unknown model architecture: '([^']+)'",
+            diagnostics,
+        )
+        if architecture_match:
+            architecture = architecture_match.group(1)
+            return ValueError(
+                "Failed to load GGUF model "
+                f"{self.settings.model_path}: llama.cpp reported unsupported "
+                f"model architecture '{architecture}' in the installed "
+                "llama-cpp-python build. Upgrade llama-cpp-python to a build "
+                "that supports this architecture or switch to a supported GGUF."
+            )
+
+        if diagnostics:
+            return ValueError(
+                "Failed to load GGUF model "
+                f"{self.settings.model_path}. llama.cpp diagnostics:\n"
+                f"{diagnostics}"
+            )
+
+        return ValueError(
+            f"Failed to load GGUF model {self.settings.model_path}: {exc}"
+        )
+
+    def _preflight_model_compatibility(self) -> None:
+        """Reject known-incompatible GGUF/runtime combinations before loading."""
+        architecture = read_gguf_architecture(self.settings.model_path)
+        runtime_version = installed_llama_cpp_version()
+        if architecture == "gemma4" and runtime_version == "0.3.19":
+            raise ValueError(
+                "Failed to load GGUF model "
+                f"{self.settings.model_path}: GGUF architecture 'gemma4' is not "
+                f"supported by the installed llama-cpp-python {runtime_version} "
+                "in this environment. Upgrade llama-cpp-python / llama.cpp or "
+                "switch to a supported GGUF."
+            )
