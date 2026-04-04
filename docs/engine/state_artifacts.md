@@ -37,8 +37,12 @@ The current session artifact contract includes:
 - `last_response`: the full user-facing response from the previous turn
 - `last_artifact_content`: the clean artifact body that should be reused for
   follow-up persistence or transformation
+- `last_artifact_responder`: which agent most recently produced the active
+  artifact
 - `last_responder`: which agent produced the previous turn
 - `last_tools_used`: the tools used by that agent on the previous turn
+- `artifact_history`: a bounded list of prior artifacts produced during the
+  session
 
 ## Why `last_artifact_content` Was Added
 
@@ -107,16 +111,44 @@ The important separation is:
 The agent prefers `artifact_content` when available and falls back to the final
 output only when needed.
 
+It now preserves the active artifact across generic planned answers unless a new
+tool result explicitly produced `artifact_content`. That avoids replacing a PDF
+insight artifact just because the user asked a follow-up question.
+
 Its session-state shape is effectively:
 
 ```python
 {
     "last_response": "...",
     "last_artifact_content": "...",
+    "last_artifact_responder": "research_assistant",
     "last_responder": "research_assistant",
     "last_tools_used": ["tool_a", "tool_b"],
+    "artifact_history": [
+        {
+            "content": "...",
+            "responder": "research_assistant",
+            "response": "...",
+            "tools_used": ["tool_a", "tool_b"],
+        }
+    ],
 }
 ```
+
+### In `chat_agent`
+
+`chat_agent` uses the same session contract, but it does not create artifacts.
+
+When it answers a generic question about the current content, it:
+
+- updates `last_response`
+- sets `last_responder` to `chat_agent`
+- preserves `last_artifact_content`
+- preserves `last_artifact_responder`
+- preserves `artifact_history`
+
+That distinction matters because a chat follow-up should not steal ownership of
+an artifact that was originally created by `research_assistant`.
 
 ### In `orchestrator`
 
@@ -128,6 +160,10 @@ available on the next turn for routing and follow-up save behavior.
 
 The orchestrator carries the same fields at the session boundary so delegated
 agents receive and return a compatible artifact-state structure.
+
+This contract now lives on `BaseAgent` rather than in individual agents. New
+agents should reuse `empty_session_state()`, `apply_session_state(...)`,
+`copy_session_state()`, and `update_session_state(...)`.
 
 ## Follow-up Save Flow
 
@@ -146,12 +182,21 @@ the system prefers a deterministic direct path:
 
 This avoids depending on the planner for a simple persistence action.
 
+The save resolver can also use `artifact_history` for references such as:
+
+- `save the first insights`
+- `save the initial insights`
+- `save the original insights`
+- `save the previous insights`
+- `save the earlier insights`
+
 ## Router Visibility
 
 The orchestrator includes a bounded excerpt of:
 
 - `last_response`
 - `last_artifact_content`
+- `last_artifact_responder`
 - `last_responder`
 - `last_tools_used`
 
@@ -162,12 +207,16 @@ in routing context. That gives the router evidence that a short follow-up like
 
 - Treat artifact continuity separately from semantic memory.
 - Prefer `last_artifact_content` over `last_response` for persistence actions.
+- Prefer `last_artifact_responder` over `last_responder` when routing artifact
+  follow-ups.
 - Preserve artifact state across agent delegation.
 - Keep artifact state exact and rendered, not abstract.
 - Do not regenerate prior artifacts when the user only asked to save them.
+- Keep artifact history bounded and session-local.
 
 ## Relevant Files
 
 - [`omnidex/tools/create_output.py`](../../omnidex/tools/create_output.py)
+- [`omnidex/agents/chat_agent/agent.py`](../../omnidex/agents/chat_agent/agent.py)
 - [`omnidex/agents/research_assistant/agent.py`](../../omnidex/agents/research_assistant/agent.py)
 - [`omnidex/agents/orchestrator/agent.py`](../../omnidex/agents/orchestrator/agent.py)

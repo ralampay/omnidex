@@ -140,3 +140,56 @@ def build_answer_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": query},
     ]
+
+
+def build_handoff_messages(
+    *,
+    system_prompt: str,
+    query: str,
+    context: str = "",
+    session_artifact_context: str = "",
+    available_agents: tuple[str, ...] = (),
+) -> list[dict[str, str]]:
+    """Build messages for a structured research-agent handoff decision."""
+    options = "\n".join(f"- {name}" for name in available_agents)
+    contextual_notes = []
+    if context.strip():
+        contextual_notes.append(
+            "Conversation and memory context:\n"
+            f"{context.strip()}"
+        )
+    if session_artifact_context.strip():
+        contextual_notes.append(
+            "Session artifact state:\n"
+            f"{session_artifact_context.strip()}"
+        )
+    context_block = "\n\n".join(contextual_notes)
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"{system_prompt.strip()}\n\n"
+                "You are deciding whether research_assistant should answer the user "
+                "directly or hand the turn to another agent.\n"
+                "Research_assistant should keep turns that request explicit research "
+                "workflows such as reading PDFs, summarizing papers, extracting "
+                "insights, structured research analysis, or save/export actions tied "
+                "to a research artifact.\n"
+                "Research_assistant should hand off to chat_agent when the user is "
+                "asking a generic question about the latest content, asking what a "
+                "specific term means, or continuing normal discussion about an "
+                "already-generated artifact rather than asking for a new research task.\n"
+                "Return ONLY valid JSON in one of these forms:\n"
+                '{"action":"answer","confidence":0.0}\n'
+                '{"action":"handoff","target_agent":"chat_agent","reason":"short reason","confidence":0.0}\n\n'
+                f"Available agents:\n{options}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"User query:\n{query.strip()}\n\n"
+                f"{context_block}" if context_block else f"User query:\n{query.strip()}"
+            ),
+        },
+    ]

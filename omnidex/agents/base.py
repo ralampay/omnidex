@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypedDict
 
+from omnidex.agents.handoffs import HandoffDecision
 from rich.console import Console
 from rich.text import Text
+
+
+class SessionState(TypedDict, total=False):
+    """Shared cross-agent session and artifact continuity contract."""
+
+    last_response: str
+    last_artifact_content: str
+    last_artifact_responder: str
+    last_responder: str
+    last_tools_used: list[str]
+    artifact_history: list[dict[str, object]]
 
 
 class BaseAgent:
@@ -28,10 +40,126 @@ class BaseAgent:
         self.console = console or Console()
         self.tools = list(tools or [])
         self.last_used_tools: list[str] = []
+        self.session_state: SessionState = self.empty_session_state()
+
+    @classmethod
+    def empty_session_state(cls) -> SessionState:
+        """Return the canonical empty shared session-state payload."""
+        return {
+            "last_response": "",
+            "last_artifact_content": "",
+            "last_artifact_responder": "",
+            "last_responder": "",
+            "last_tools_used": [],
+            "artifact_history": [],
+        }
+
+    def copy_session_state(self) -> SessionState:
+        """Return a shallow copy of the current shared session state."""
+        return {
+            "last_response": str(self.session_state.get("last_response", "") or ""),
+            "last_artifact_content": str(
+                self.session_state.get("last_artifact_content", "") or ""
+            ),
+            "last_artifact_responder": str(
+                self.session_state.get("last_artifact_responder", "") or ""
+            ),
+            "last_responder": str(self.session_state.get("last_responder", "") or ""),
+            "last_tools_used": list(self.session_state.get("last_tools_used", [])),
+            "artifact_history": [
+                dict(item)
+                for item in self.session_state.get("artifact_history", [])
+                if isinstance(item, dict)
+            ],
+        }
+
+    def apply_session_state(self, state: SessionState | dict[str, object] | None) -> None:
+        """Load shared session state while preserving the canonical contract shape."""
+        incoming = state or {}
+        self.session_state = {
+            "last_response": str(incoming.get("last_response", "") or ""),
+            "last_artifact_content": str(
+                incoming.get("last_artifact_content", "") or ""
+            ),
+            "last_artifact_responder": str(
+                incoming.get("last_artifact_responder", "") or ""
+            ),
+            "last_responder": str(incoming.get("last_responder", "") or ""),
+            "last_tools_used": list(incoming.get("last_tools_used", [])),
+            "artifact_history": [
+                dict(item)
+                for item in incoming.get("artifact_history", [])
+                if isinstance(item, dict)
+            ],
+        }
+
+    def update_session_state(
+        self,
+        *,
+        response: str,
+        artifact_content: str | None = None,
+        artifact_responder: str | None = None,
+    ) -> None:
+        """Update the shared session state after an agent response."""
+        preserved_artifact = (
+            str(self.session_state.get("last_artifact_content", "") or "").strip()
+        )
+        next_artifact = (
+            preserved_artifact
+            if artifact_content is None
+            else str(artifact_content or "").strip()
+        )
+        preserved_artifact_responder = str(
+            self.session_state.get("last_artifact_responder", "") or ""
+        ).strip()
+        next_artifact_responder = (
+            preserved_artifact_responder
+            if artifact_responder is None
+            else str(artifact_responder or "").strip()
+        )
+        artifact_history = [
+            dict(item)
+            for item in self.session_state.get("artifact_history", [])
+            if isinstance(item, dict)
+        ]
+        if (
+            artifact_content is not None
+            and next_artifact
+            and next_artifact != preserved_artifact
+        ):
+            artifact_history.append(
+                {
+                    "content": next_artifact,
+                    "responder": next_artifact_responder or self.name,
+                    "response": response,
+                    "tools_used": list(self.last_used_tools),
+                }
+            )
+            artifact_history = artifact_history[-8:]
+        if not next_artifact:
+            next_artifact_responder = ""
+        self.session_state = {
+            "last_response": response,
+            "last_artifact_content": next_artifact,
+            "last_artifact_responder": next_artifact_responder,
+            "last_responder": self.name,
+            "last_tools_used": list(self.last_used_tools),
+            "artifact_history": artifact_history,
+        }
 
     def run(self, query: str, context: str = "") -> str:
         """Execute the agent's core task for the given query and context."""
         raise NotImplementedError("Subclasses must implement run().")
+
+    def propose_handoff(
+        self,
+        query: str,
+        *,
+        context: str = "",
+        available_agents: tuple[str, ...] = (),
+    ) -> HandoffDecision | None:
+        """Optionally ask the orchestrator to hand off to another agent."""
+        return None
 
     def __call__(self, query: str, context: str = "") -> str:
         """Invoke the agent like a callable."""
@@ -95,3 +223,6 @@ class EchoAgent(BaseAgent):
     def run(self, query: str, context: str = "") -> str:
         """Return the query as a plain echoed response."""
         return f"Echo: {query}"
+
+
+__all__ = ["BaseAgent", "EchoAgent", "SessionState"]

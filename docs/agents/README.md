@@ -5,11 +5,43 @@ This directory documents the agents currently shipped with omnidex.
 ## Available Agents
 
 - `orchestrator`
+- `chat_agent`
+- `research_assistant`
 
 ## Agent Overview
 
-- `orchestrator`: Runs as an interactive local-first chat agent backed by a GGUF
-  model loaded through `llama-cpp-python`.
+- `orchestrator`: Runs as an interactive local-first delegator backed by a GGUF
+  model loaded through `llama-cpp-python`. It routes each turn to a delegated
+  specialist and does not act as the final chat responder.
+- `chat_agent`: Handles general conversation on any topic, plus questions about
+  the current session context or active artifact. It does not use tools.
+- `research_assistant`: Handles research-oriented requests, PDF summarization,
+  insight extraction, and follow-up save/export flows.
+
+## Shared Agent Contract
+
+All execution agents should inherit from `BaseAgent`. The base class now owns
+the shared session-state and handoff contract used across OmniDex.
+
+Shared session fields:
+
+- `last_response`
+- `last_artifact_content`
+- `last_artifact_responder`
+- `last_responder`
+- `last_tools_used`
+- `artifact_history`
+
+Shared base methods:
+
+- `empty_session_state()`
+- `copy_session_state()`
+- `apply_session_state(...)`
+- `update_session_state(...)`
+- `propose_handoff(...)`
+
+This means new agents should participate in the same artifact continuity and
+handoff protocol by default instead of inventing their own state shape.
 
 ## CLI Entry Points
 

@@ -219,7 +219,7 @@ not by `LocalChatModel` alone.
 
 ## How Agents Use These Components
 
-Both major agents follow the same pattern:
+The main delegated agents follow the same pattern:
 
 ```python
 self.settings = LocalLLMSettings.from_env(system_prompt=DEFAULT_SYSTEM_PROMPT)
@@ -228,8 +228,15 @@ self.model = LocalChatModel(self.settings)
 
 After that, the agent controls inference by changing the message list.
 
-- `OrchestratorAgent` uses the same local model for route classification and chat responses
-- `ResearchAssistant` uses the same local model for summarization, PDF question answering, and summary refinement
+- `OrchestratorAgent` uses the local model for initial route proposals
+- `ChatAgent` uses the local model for general chat responses and handoff
+  proposals grounded in shared context
+- `ResearchAssistant` uses the same local model for summarization, PDF question
+  answering, research planning, and handoff proposals
+
+The orchestrator is not the final chat responder. It uses inference to choose an
+initial delegate, then validates that proposal through shared policy rules. The
+same pattern applies to agent-to-agent handoffs.
 
 So when `LocalChatModel` is passed into or attached to an agent, it should be
 understood as the common inference engine, while the agent remains responsible

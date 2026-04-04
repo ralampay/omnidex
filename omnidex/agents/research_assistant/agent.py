@@ -7,9 +7,13 @@ import json
 from rich.table import Table
 
 from omnidex.agents.base import BaseAgent
+from omnidex.agents.handoffs import HandoffDecision
 from omnidex.agents.research_assistant.commands import SummarizePdfCommand
 from omnidex.engine import GeneratePlanCommand
-from omnidex.agents.research_assistant.prompts import DEFAULT_SYSTEM_PROMPT
+from omnidex.agents.research_assistant.prompts import (
+    DEFAULT_SYSTEM_PROMPT,
+    build_handoff_messages,
+)
 from omnidex.runtime import LocalChatModel, LocalLLMSettings
 from omnidex.tools.answer_question import AnswerQuestionTool
 from omnidex.tools.create_output import CreateOutputTool
@@ -24,6 +28,8 @@ from omnidex.tools.summarize_text import SummarizeTextTool
 from omnidex.utils.plan_execution import execute_tool_plan
 from omnidex.utils.planning import ToolPlanStep
 from omnidex.utils.text import compute_input_char_budget, truncate_text
+from omnidex.utils.json_tools import load_json_object
+from omnidex.utils.paths import has_explicit_output_request
 
 
 class ResearchAssistant(BaseAgent):
@@ -84,7 +90,142 @@ class ResearchAssistant(BaseAgent):
             emit=self.emit,
             log=self.log,
         )
-        self.session_state: dict[str, object] = {}
+
+    def _session_artifact_context(self) -> str:
+        """Render compact session artifact state for routing and handoff prompts."""
+        last_response = truncate_text(
+            str(self.session_state.get("last_response", "") or ""),
+            limit=500,
+        )
+        last_artifact_content = truncate_text(
+            str(self.session_state.get("last_artifact_content", "") or ""),
+            limit=900,
+        )
+        last_artifact_responder = str(
+            self.session_state.get("last_artifact_responder", "") or ""
+        ).strip()
+        last_responder = str(self.session_state.get("last_responder", "") or "").strip()
+        lines = []
+        if last_responder:
+            lines.append(f"Last responder: {last_responder}")
+        if last_artifact_responder:
+            lines.append(f"Active artifact owner: {last_artifact_responder}")
+        if last_response:
+            lines.append(f"Last response excerpt:\n{last_response}")
+        if last_artifact_content:
+            lines.append(f"Active artifact excerpt:\n{last_artifact_content}")
+        return "\n\n".join(lines)
+
+    def propose_handoff(
+        self,
+        query: str,
+        *,
+        context: str = "",
+        available_agents: tuple[str, ...] = (),
+    ) -> HandoffDecision | None:
+        """Use the local model to decide whether another agent should take over."""
+        messages = build_handoff_messages(
+            system_prompt=self.settings.system_prompt,
+            query=query,
+            context=truncate_text(context, limit=1200),
+            session_artifact_context=self._session_artifact_context(),
+            available_agents=available_agents,
+        )
+        output = self.model.generate_text(messages, stream=False)
+        payload = load_json_object(output)
+        if payload is None:
+            return None
+
+        action = str(payload.get("action", "")).strip().casefold()
+        if action != "handoff":
+            return None
+
+        target_agent = str(payload.get("target_agent", "")).strip()
+        if not target_agent or target_agent == self.name:
+            return None
+
+        try:
+            confidence = float(payload.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        return HandoffDecision(
+            target_agent=target_agent,
+            reason=str(payload.get("reason", "")).strip(),
+            confidence=max(0.0, min(1.0, confidence)),
+        )
+
+    def _should_keep_direct_save_followup(self, query: str) -> bool:
+        """Detect explicit save/export follow-ups that should stay in research."""
+        normalized_query = query.casefold()
+        if ".pdf" in normalized_query:
+            return False
+
+        last_artifact_content = str(
+            self.session_state.get("last_artifact_content", "") or ""
+        ).strip()
+        last_response = str(self.session_state.get("last_response", "") or "").strip()
+        content_to_save = last_artifact_content or last_response
+        if not content_to_save:
+            return False
+
+        output_request_tool = self.get_tool("extract_output_request")
+        if output_request_tool is None:
+            return False
+
+        output_request = output_request_tool.run(query=query)
+        write_output = bool(output_request.get("write_output"))
+        filename = output_request.get("filename")
+        return bool(write_output and filename)
+
+    def _planning_tools_for_query(self, query: str) -> list[object]:
+        """Return the planner-visible tool set for the current query."""
+        if has_explicit_output_request(query):
+            return list(self.tools)
+        excluded = {"determine_output_write", "extract_output_request"}
+        return [
+            tool for tool in self.tools
+            if getattr(tool, "name", "") not in excluded
+        ]
+
+    def _resolve_artifact_content_for_save(self, query: str) -> str:
+        """Resolve which preserved artifact should be written for a save request."""
+        normalized_query = " ".join(query.casefold().split())
+        history = [
+            item
+            for item in self.session_state.get("artifact_history", [])
+            if isinstance(item, dict)
+        ]
+        if history:
+            if any(
+                phrase in normalized_query
+                for phrase in (
+                    "from the start",
+                    "first insight",
+                    "first insights",
+                    "initial insight",
+                    "initial insights",
+                    "original insight",
+                    "original insights",
+                )
+            ):
+                return str(history[0].get("content") or "").strip()
+            if any(
+                phrase in normalized_query
+                for phrase in (
+                    "previous insight",
+                    "previous insights",
+                    "earlier insight",
+                    "earlier insights",
+                )
+            ) and len(history) >= 2:
+                return str(history[-2].get("content") or "").strip()
+
+        last_artifact_content = str(
+            self.session_state.get("last_artifact_content", "") or ""
+        ).strip()
+        last_response = str(self.session_state.get("last_response", "") or "").strip()
+        return last_artifact_content or last_response
 
     def _render_plan(self, plan: list[ToolPlanStep]) -> None:
         """Render a generated plan as a readable table."""
@@ -163,13 +304,11 @@ class ResearchAssistant(BaseAgent):
         preserved_artifact = artifact_content.strip() or str(
             self.session_state.get("last_artifact_content", "") or ""
         ).strip()
-        self.session_state = {
-            **self.session_state,
-            "last_response": response,
-            "last_responder": self.name,
-            "last_tools_used": list(self.last_used_tools),
-            "last_artifact_content": preserved_artifact,
-        }
+        self.update_session_state(
+            response=response,
+            artifact_content=preserved_artifact,
+            artifact_responder=self.name if preserved_artifact else "",
+        )
 
     def _run_direct_pdf_flow(self, query: str) -> str | None:
         """Handle obvious PDF summary/insight requests without planner latency."""
@@ -259,11 +398,7 @@ class ResearchAssistant(BaseAgent):
         if ".pdf" in normalized_query:
             return None
 
-        last_artifact_content = str(
-            self.session_state.get("last_artifact_content", "") or ""
-        ).strip()
-        last_response = str(self.session_state.get("last_response", "") or "").strip()
-        content_to_save = last_artifact_content or last_response
+        content_to_save = self._resolve_artifact_content_for_save(query)
         if not content_to_save:
             return None
 
@@ -316,6 +451,7 @@ class ResearchAssistant(BaseAgent):
             "query": query,
             "last_response": self.session_state.get("last_response", ""),
             "last_artifact_content": self.session_state.get("last_artifact_content", ""),
+            "last_artifact_responder": self.session_state.get("last_artifact_responder", ""),
             "last_responder": self.session_state.get("last_responder", ""),
             "last_tools_used": self.session_state.get("last_tools_used", []),
         }
@@ -325,10 +461,18 @@ class ResearchAssistant(BaseAgent):
                 str(initial_state["last_artifact_content"]),
                 limit=1500,
             ),
+            "last_artifact_responder": initial_state["last_artifact_responder"],
             "last_responder": initial_state["last_responder"],
             "last_tools_used": initial_state["last_tools_used"],
         }
-        tool_plan = self.generate_plan_command.execute(
+        planning_tools = self._planning_tools_for_query(query)
+        generate_plan_command = GeneratePlanCommand(
+            model=self.model,
+            tools=planning_tools,
+            emit=self.emit,
+            log=self.log,
+        )
+        tool_plan = generate_plan_command.execute(
             query,
             initial_state=planning_state,
         )
@@ -360,11 +504,10 @@ class ResearchAssistant(BaseAgent):
         )
         self.log("Research query completed.")
         final_output = execution.final_output or "No output generated."
-        artifact_content = ""
         final_state = execution.state.get("final")
-        artifact_content = self._extract_artifact_content(final_state)
-        if not artifact_content:
-            artifact_content = final_output.strip()
+        artifact_content = ""
+        if isinstance(final_state, dict):
+            artifact_content = str(final_state.get("artifact_content") or "").strip()
         self._update_session_artifact(
             response=final_output,
             artifact_content=artifact_content,

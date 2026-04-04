@@ -22,7 +22,7 @@ def find_path_with_suffix(query: str, suffix: str) -> str | None:
 def extract_output_filename(query: str) -> str | None:
     """Extract an explicit output filename from a user request."""
     patterns = (
-        r'(?:save|write|export)\s+(?:the\s+)?(?:output|result|summary|report|answer)?\s*(?:to|as|into)\s+(?P<path>"[^"]+"|\'[^\']+\'|[^\s,;:]+)',
+        r'(?:save|write|export)\s+(?:the\s+)?(?:output|result|summary|report|answer|artifact|insight|insights|it|this|that)?\s*(?:to|as|into|in|under|at)\s+(?:file\s+)?(?P<path>"[^"]+"|\'[^\']+\'|[^\s,;:]+)',
         r'(?:filename|file name|output file)\s*(?:is|=|:)?\s*(?P<path>"[^"]+"|\'[^\']+\'|[^\s,;:]+)',
         r'(?:call|name)\s+(?:the\s+)?(?:output|file)\s+(?P<path>"[^"]+"|\'[^\']+\'|[^\s,;:]+)',
     )
@@ -33,13 +33,20 @@ def extract_output_filename(query: str) -> str | None:
         candidate = match.group("path").strip("\"'").strip()
         if candidate:
             return candidate
+    generic_path_match = re.search(
+        r'(?P<path>"(?:~?/|\.{1,2}/|/)[^"]+"|\'(?:~?/|\.{1,2}/|/)[^\']+\'|(?:~?/|\.{1,2}/|/)[^\s,;:]+)',
+        query,
+        re.IGNORECASE,
+    )
+    if generic_path_match:
+        return generic_path_match.group("path").strip("\"'").strip()
     return None
 
 
 def has_explicit_output_request(query: str) -> bool:
     """Return whether the user explicitly asked to persist or name output."""
     patterns = (
-        r'(?:save|write|export)\s+(?:the\s+)?(?:output|result|summary|report|answer)?\s*(?:to|as|into)\s+(?:"[^"]+"|\'[^\']+\'|[^\s,;:]+)',
+        r'(?:save|write|export)\s+(?:the\s+)?(?:output|result|summary|report|answer|artifact|insight|insights|it|this|that)?\s*(?:to|as|into|in|under|at)\s+(?:file\s+)?(?:"[^"]+"|\'[^\']+\'|[^\s,;:]+)',
         r'(?:filename|file name|output file)\s*(?:is|=|:)?\s*(?:"[^"]+"|\'[^\']+\'|[^\s,;:]+)',
         r'(?:call|name)\s+(?:the\s+)?(?:output|file)\s+(?:"[^"]+"|\'[^\']+\'|[^\s,;:]+)',
     )

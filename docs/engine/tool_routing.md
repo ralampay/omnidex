@@ -354,7 +354,7 @@ This distinction is important:
 - explicit PDF insights request: direct flow
 - follow-up save/export with a prior artifact: direct flow
 - ambiguous or open-ended research request: planned flow
-- generic chat request: handled by the orchestrator chat path, not this agent
+- generic chat request: handled by `chat_agent`, not this agent
 
 ## Tradeoffs
 

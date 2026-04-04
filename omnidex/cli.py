@@ -15,7 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Create the OmniDex CLI parser."""
     parser = argparse.ArgumentParser(
         prog="python -m omnidex",
-        description="Run the local OmniDex orchestrator agent.",
+        description="Run the local OmniDex orchestrator delegator.",
     )
     parser.add_argument(
         "--prompt",

@@ -8,14 +8,16 @@ OmniDex uses a hybrid of:
 
 - orchestrator pattern
 - plan-and-execute agent pattern
-- deterministic fast paths for obvious tool pipelines
+- policy-validated agentic routing and handoffs
+- deterministic fast paths for explicit direct workflows
 - blackboard-style shared state
 - ephemeral session artifact state
+- bounded artifact history
 
 The orchestrator decides which handler should receive the current turn.
 Specialized agents then either:
 
-- execute a deterministic direct flow for obvious tasks
+- execute a deterministic direct flow for explicit tasks
 - or generate a tool plan and execute it against a shared step state
 
 Follow-up requests like `save it` rely on short-lived session artifact state
@@ -42,11 +44,20 @@ continuation of that artifact.
 
 The orchestrator routes across registered handlers:
 
-- `chat`
+- `chat_agent`
 - `research_assistant`
 
-Routing is model-driven. The router prompt is built from the registered
-handlers at runtime. It also receives:
+Routing is now two-stage and agentic:
+
+1. the orchestrator asks the local model to choose the best initial handler
+2. a shared policy validator accepts or overrides the proposed route only for
+   hard constraints
+3. the selected agent may request a handoff before execution
+4. the shared policy validator accepts or rejects the proposed handoff only for
+   hard constraints
+
+The router prompt is built from the registered handlers at runtime. It also
+receives:
 
 - bounded conversational memory
 - ephemeral session artifact state
@@ -55,11 +66,27 @@ Session artifact state includes:
 
 - `last_response`
 - `last_artifact_content`
+- `last_artifact_responder`
 - `last_responder`
 - `last_tools_used`
+- `artifact_history`
 
 This lets the router keep a follow-up `save it` request with the same handler
-that produced the prior artifact.
+that owns the active artifact, even if the previous conversational turn was
+answered by a different agent.
+
+This allows the system to recover when the initial route is imperfect. For
+example, if `research_assistant` receives a turn that is really just a generic
+question about the current artifact, it can request a handoff to `chat_agent`.
+
+The current design is a policy model with validation:
+
+- the model proposes the initial route
+- the model can propose agent-to-agent handoffs
+- a shared validator only enforces hard constraints such as:
+  - explicit PDF workflows staying with `research_assistant`
+  - explicit save/export follow-ups staying with `research_assistant` when it
+    can complete them
 
 For referential persistence requests such as:
 
@@ -75,7 +102,20 @@ current request is a continuation of the prior artifact.
 
 ### 2. Agent Decision Layer
 
-`research_assistant` uses a hybrid strategy.
+The selected agent can first make a structured handoff decision.
+
+This is model-driven rather than hard-coded. The agent returns one of:
+
+- answer directly
+- hand off to another registered agent with a reason and confidence
+
+The orchestrator then validates the proposal against shared hard constraints.
+If valid, the handoff is accepted. If not, the current agent keeps the turn.
+
+The orchestrator also allows only a bounded handoff chain so the turn cannot
+bounce forever.
+
+After the handoff check, `research_assistant` uses a hybrid strategy.
 
 It first checks for deterministic direct flows:
 
@@ -84,6 +124,10 @@ It first checks for deterministic direct flows:
 - explicit follow-up save or export requests with an existing artifact
 
 If none of those apply, it falls back to model-planned tool execution.
+
+`chat_agent` is the default conversational responder. It can answer broad
+general-topic questions with no tools, and it can also answer questions about
+the active artifact when the shared session state is enough.
 
 ### 3. Agent Planning
 
@@ -109,11 +153,17 @@ The planner can reference:
 - `$context`
 - `$last_response`
 - `$last_artifact_content`
+- `$last_artifact_responder`
 - `$last_responder`
 - `$state.some_step.some_field`
 
 That is what enables planned follow-up save behavior even when the direct path
 does not fire.
+
+For ordinary non-save turns, `research_assistant` now hides write-intent tools
+from the planner. `determine_output_write` and `extract_output_request` are only
+exposed when the current query contains an explicit output request. This reduces
+false write/save plans on generic concept questions.
 
 ### 4. Generic Tool Execution
 
@@ -162,8 +212,10 @@ Used for:
 
 - exact last response body
 - exact last artifact body
-- who produced it
+- which agent owns the current artifact
+- which agent produced the previous turn
 - which tools were used
+- a bounded history of prior artifacts in this session
 
 This is the correct place for `save it`, `export that`, and `write the previous
 result to a file`.
@@ -222,9 +274,25 @@ For this case the system now usually takes a deterministic direct follow-up save
 path. The planner still supports it, but it is no longer required for the common
 case.
 
+The filename extraction layer now supports common phrasings such as:
+
+- `save it to /path/file.md`
+- `save it to file /path/file.md`
+- `save this as /path/file.md`
+- `write that into /path/file.md`
+- `output file: /path/file.md`
+
+There is also a generic path fallback for `~/...`, `./...`, `../...`, and
+absolute paths.
+
 ## Design Rules
 
-- Keep routing model-driven over registered handlers.
+- Keep initial routing and handoffs model-proposed.
+- Keep validation narrow and explicit.
+- Let `chat_agent` own ordinary chat and artifact discussion.
+- Let `research_assistant` own explicit research workflows and artifact
+  persistence.
+- Preserve session artifact state across delegation boundaries.
 - Keep obvious high-confidence flows deterministic when planning would add only
   latency.
 - Keep tool planning model-driven over registered tools.
@@ -258,6 +326,7 @@ Costs:
 
 - [`omnidex/engine/planner.py`](../../omnidex/engine/planner.py)
 - [`omnidex/engine/planner_prompts.py`](../../omnidex/engine/planner_prompts.py)
+- [`omnidex/agents/chat_agent/agent.py`](../../omnidex/agents/chat_agent/agent.py)
 - [`omnidex/agents/orchestrator/agent.py`](../../omnidex/agents/orchestrator/agent.py)
 - [`omnidex/agents/research_assistant/agent.py`](../../omnidex/agents/research_assistant/agent.py)
 - [`omnidex/agents/research_assistant/prompts.py`](../../omnidex/agents/research_assistant/prompts.py)

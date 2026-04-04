@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Callable
 
 from omnidex.engine.planner_prompts import (
@@ -147,5 +148,51 @@ class GeneratePlanCommand:
             )
 
         if normalized_plan:
+            validation_error = self._validate_plan_references(normalized_plan)
+            if validation_error:
+                return [], validation_error
             return normalized_plan, ""
         return [], "planner returned an empty or invalid plan"
+
+    def _validate_plan_references(self, plan: list[ToolPlanStep]) -> str:
+        """Validate that state references only point to earlier plan outputs."""
+        available_outputs: set[str] = set()
+        for step in plan:
+            missing_reference = self._first_missing_state_reference(
+                step.inputs,
+                available_outputs=available_outputs,
+            )
+            if missing_reference:
+                return (
+                    f"step '{step.tool_name}' references missing state key "
+                    f"'{missing_reference}' before it is produced"
+                )
+            available_outputs.add(step.output_key)
+        return ""
+
+    def _first_missing_state_reference(
+        self,
+        value: object,
+        *,
+        available_outputs: set[str],
+    ) -> str:
+        """Return the first unresolved $state.<output_key> reference, if any."""
+        for reference in self._iter_state_references(value):
+            output_key = reference.split(".", 1)[0].strip()
+            if output_key and output_key not in available_outputs:
+                return output_key
+        return ""
+
+    def _iter_state_references(self, value: object) -> Iterable[str]:
+        """Yield dotted $state references found anywhere inside a plan input payload."""
+        if isinstance(value, str):
+            if value.startswith("$state."):
+                yield value[len("$state.") :]
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from self._iter_state_references(item)
+            return
+        if isinstance(value, list):
+            for item in value:
+                yield from self._iter_state_references(item)

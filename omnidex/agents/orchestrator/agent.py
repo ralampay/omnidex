@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Sequence
 
-from rich.console import Console, Group
-from rich.live import Live
+from rich.console import Console
 from rich.markdown import Markdown
 from rich.prompt import Prompt
-from rich.spinner import Spinner
 from rich.text import Text
 
+from omnidex.agents.base import BaseAgent, SessionState
+from omnidex.agents.chat_agent import ChatAgent
+from omnidex.agents.handoffs import HandoffDecision
+from omnidex.agents.policy import AgentPolicyValidator
 from omnidex.memory import MemoryManager
 from omnidex.agents.research_assistant import ResearchAssistant
 from omnidex.runtime import LocalChatModel, LocalLLMSettings
@@ -22,15 +23,15 @@ from omnidex.utils.json_tools import load_json_object
 DEFAULT_SYSTEM_PROMPT = """You are OmniDex, a local orchestrator agent.
 
 You run entirely against a local model and help the user interact with local agents.
-For now, behave as a capable general chat assistant. Be concise, accurate, and explicit
-about uncertainty. Do not claim to access remote services or tools unless the user asks
-for code or instructions to add them later. Depending on the inquiry, you should delegate 
-tasks to one or more of the following agents:
+Be concise, accurate, and explicit about uncertainty. Route each turn to the best
+specialized agent instead of answering as the final responder yourself.
+Available agents:
+- chat_agent
 - research_assistant
 """
 
 class OrchestratorAgent:
-    """Local first-chat agent with a Rich terminal UI."""
+    """Delegating orchestrator with a Rich terminal UI."""
 
     def __init__(
         self,
@@ -46,21 +47,21 @@ class OrchestratorAgent:
             short_term_limit=self._short_term_limit(),
             long_term_path=self._memory_path(),
         )
-        self.session_state: dict[str, object] = {
-            "last_response": "",
-            "last_artifact_content": "",
-            "last_responder": "",
-            "last_tools_used": [],
-        }
+        self.session_state: SessionState = BaseAgent.empty_session_state()
         self.agents = {
+            "chat_agent": ChatAgent(
+                console=self.console,
+                verbose=True,
+            ),
             "research_assistant": ResearchAssistant(
                 console=self.console,
                 verbose=True,
             ),
         }
+        self.policy = AgentPolicyValidator(agents=self.agents)
 
     def run(self) -> int:
-        """Run the interactive chat session."""
+        """Run the interactive orchestration session."""
         self._render_banner()
         self._render_help()
 
@@ -91,7 +92,7 @@ class OrchestratorAgent:
             try:
                 route, confidence, route_source = self._route(user_prompt, routing_context)
             except Exception:
-                route = "chat"
+                route = "chat_agent"
                 confidence = 0.0
                 route_source = "default_fallback"
         self._render_event(
@@ -99,53 +100,41 @@ class OrchestratorAgent:
             style="blue",
         )
         self._debug_route(route, confidence, route_source)
-
-        if route == "chat":
-            self._render_event("Active agent: chat", style="cyan")
-            response, already_rendered = self._generate_response(
-                user_prompt,
-                context=context,
-                stream=stream,
-            )
-            responder = "OmniDex"
-            tools_used: list[str] = []
-        else:
-            agent = self.agents[route]
-            if hasattr(agent, "session_state"):
-                agent.session_state = dict(self.session_state)
-            self._render_event(f"Active agent: {agent.name}", style="cyan")
-            self._render_event(f"Delegating to agent: {agent.name}", style="cyan")
-            with self.console.status(
-                f"[bold cyan]{agent.name} is working...[/bold cyan]",
-                spinner="dots",
-            ):
-                response = agent.safe_run(user_prompt, context=context)
-            already_rendered = False
-            responder = agent.name
-            tools_used = list(agent.last_used_tools)
-            delegated_state = dict(getattr(agent, "session_state", {}))
+        response, responder, tools_used, delegated_state = self._delegate_with_handoffs(
+            route=route,
+            user_prompt=user_prompt,
+            context=context,
+            stream=stream,
+        )
+        already_rendered = False
 
         self.memory.add_interaction("user", user_prompt)
         self.memory.add_interaction("assistant", response)
         self.memory.extract_and_store(user_prompt, response)
         preserved_artifact = str(self.session_state.get("last_artifact_content", "") or "").strip()
-        if route == "chat":
-            self.session_state = {
-                "last_response": response,
-                "last_artifact_content": preserved_artifact,
-                "last_responder": responder,
-                "last_tools_used": tools_used,
-            }
-        else:
-            delegated_artifact = str(
-                delegated_state.get("last_artifact_content", "") or ""
-            ).strip()
-            self.session_state = {
-                "last_response": str(delegated_state.get("last_response") or response),
-                "last_artifact_content": delegated_artifact or preserved_artifact,
-                "last_responder": str(delegated_state.get("last_responder") or responder),
-                "last_tools_used": delegated_state.get("last_tools_used", tools_used),
-            }
+        preserved_artifact_responder = str(
+            self.session_state.get("last_artifact_responder", "") or ""
+        ).strip()
+        delegated_artifact = str(
+            delegated_state.get("last_artifact_content", "") or ""
+        ).strip()
+        delegated_artifact_responder = str(
+            delegated_state.get("last_artifact_responder", "") or ""
+        ).strip()
+        self.session_state = {
+            "last_response": str(delegated_state.get("last_response") or response),
+            "last_artifact_content": delegated_artifact or preserved_artifact,
+            "last_artifact_responder": (
+                delegated_artifact_responder
+                or (preserved_artifact_responder if delegated_artifact or preserved_artifact else "")
+            ),
+            "last_responder": str(delegated_state.get("last_responder") or responder),
+            "last_tools_used": delegated_state.get("last_tools_used", tools_used),
+            "artifact_history": delegated_state.get(
+                "artifact_history",
+                self.session_state.get("artifact_history", []),
+            ),
+        }
         self._render_event(
             f"Delegated agent tools used: {', '.join(tools_used) if tools_used else 'none'}",
             style="yellow",
@@ -157,10 +146,13 @@ class OrchestratorAgent:
 
     def _route(self, user_input: str, context: str) -> tuple[str, float, str]:
         """Route through the model over registered handlers."""
-        route, confidence = self._llm_route(user_input, context)
-        if route in self._route_options():
-            return route, confidence, "llm"
-        return "chat", 0.0, "default_fallback"
+        proposed_route, confidence = self._llm_route(user_input, context)
+        validation = self.policy.validate_initial_route(
+            proposed_route=proposed_route,
+            query=user_input,
+            session_state=self.session_state,
+        )
+        return validation.target_agent, confidence, validation.source
 
     def _llm_route(self, user_input: str, context: str) -> tuple[str, float]:
         """Ask the local model to choose a route from registered options."""
@@ -193,16 +185,11 @@ class OrchestratorAgent:
 
     def _route_options(self) -> set[str]:
         """Return the available route names."""
-        return {"chat", *self.agents.keys()}
+        return set(self.agents.keys())
 
     def _build_router_system_prompt(self) -> str:
         """Build a routing prompt from the registered agents."""
-        options = [
-            {
-                "name": "chat",
-                "description": "General conversation handled directly by the orchestrator.",
-            }
-        ]
+        options = []
         for name, agent in self.agents.items():
             description = getattr(agent, "description", "") or f"Delegates to {name}."
             options.append({"name": name, "description": description})
@@ -215,15 +202,141 @@ class OrchestratorAgent:
             "You are a routing agent.\n\n"
             "Choose the best handler for the user input from the available options.\n"
             "You will receive both conversation memory and session artifact state.\n"
+            "Pick the best initial agent, not necessarily the final one. "
+            "The selected agent may request a handoff after seeing the turn.\n"
+            "Prefer chat_agent for generic conversation, questions about the current "
+            "content, requests to explain a term from the latest artifact, and normal "
+            "follow-up discussion about previously generated output.\n"
+            "Prefer research_assistant for explicit research workflows such as PDF "
+            "ingestion, summarization, insight extraction, structured research analysis, "
+            "or artifact persistence/transformation requests.\n"
             "When the user refers to a previous artifact using phrases like 'save it', "
             "'save this', 'write that', or 'export it', interpret that as a continuation "
             "of the previous artifact if the session artifact state supports it.\n"
-            "Prefer the same handler that produced the prior artifact when the current "
+            "Prefer the same handler that owns the active artifact when the current "
             "request is about persisting, exporting, or transforming that artifact.\n"
             "Do not ignore session artifact state when the current user input is short or ambiguous.\n"
             "Return ONLY valid JSON in this format:\n"
-            '{\n  "route": "chat",\n  "confidence": 0.0\n}\n\n'
+            '{\n  "route": "chat_agent",\n  "confidence": 0.0\n}\n\n'
             f"Available options:\n{option_lines}\n"
+        )
+
+    def _request_agent_handoff(
+        self,
+        *,
+        agent_name: str,
+        user_prompt: str,
+        context: str,
+    ) -> HandoffDecision | None:
+        """Ask the current agent whether the turn should be handed off."""
+        agent = self.agents[agent_name]
+        proposer = getattr(agent, "propose_handoff", None)
+        if proposer is None:
+            return None
+        try:
+            decision = proposer(
+                user_prompt,
+                context=context,
+                available_agents=tuple(self.agents.keys()),
+            )
+        except Exception as exc:
+            self._render_event(
+                f"Handoff evaluation failed for {agent_name}: {exc}",
+                style="red",
+            )
+            return None
+        if decision is None:
+            return None
+        if decision.target_agent not in self.agents:
+            return None
+        if decision.target_agent == agent_name:
+            return None
+        return decision
+
+    def _delegate_with_handoffs(
+        self,
+        *,
+        route: str,
+        user_prompt: str,
+        context: str,
+        stream: bool | None,
+    ) -> tuple[str, str, list[str], dict[str, object]]:
+        """Execute the selected agent, allowing bounded model-driven handoffs."""
+        current_route = route
+        visited = {current_route}
+        handoff_limit = 2
+
+        for _ in range(handoff_limit + 1):
+            agent = self.agents[current_route]
+            if isinstance(agent, BaseAgent):
+                agent.apply_session_state(self.session_state)
+            if hasattr(agent, "set_stream_override"):
+                agent.set_stream_override(stream)
+
+            self._render_event(f"Active agent: {agent.name}", style="cyan")
+            decision = self._request_agent_handoff(
+                agent_name=current_route,
+                user_prompt=user_prompt,
+                context=context,
+            )
+            validation = self.policy.validate_handoff(
+                current_agent=current_route,
+                decision=decision,
+                query=user_prompt,
+                session_state=self.session_state,
+            )
+            if (
+                validation.accepted
+                and validation.source == "handoff_validated"
+                and decision is not None
+                and decision.confidence >= 0.5
+                and validation.target_agent not in visited
+            ):
+                self._render_event(
+                    "Agent handoff: "
+                    f"{current_route} -> {validation.target_agent} "
+                    f"(confidence={decision.confidence:.2f})"
+                    + (f" [{decision.reason}]" if decision.reason else ""),
+                    style="magenta",
+                )
+                current_route = validation.target_agent
+                visited.add(current_route)
+                continue
+            if (
+                decision is not None
+                and validation.source == "handoff_rejected"
+                and validation.reason
+            ):
+                self._render_event(
+                    f"Handoff blocked: {validation.reason}",
+                    style="yellow",
+                )
+
+            self._render_event(f"Delegating to agent: {agent.name}", style="cyan")
+            with self.console.status(
+                f"[bold cyan]{agent.name} is working...[/bold cyan]",
+                spinner="dots",
+            ):
+                response = agent.safe_run(user_prompt, context=context)
+            return (
+                response,
+                agent.name,
+                list(agent.last_used_tools),
+                agent.copy_session_state() if isinstance(agent, BaseAgent) else {},
+            )
+
+        agent = self.agents[current_route]
+        self._render_event(f"Delegating to agent: {agent.name}", style="cyan")
+        with self.console.status(
+            f"[bold cyan]{agent.name} is working...[/bold cyan]",
+            spinner="dots",
+        ):
+            response = agent.safe_run(user_prompt, context=context)
+        return (
+            response,
+            agent.name,
+            list(agent.last_used_tools),
+            agent.copy_session_state() if isinstance(agent, BaseAgent) else {},
         )
 
     def _routing_context(self, memory_context: str) -> str:
@@ -231,6 +344,9 @@ class OrchestratorAgent:
         last_response = str(self.session_state.get("last_response", "") or "").strip()
         last_artifact_content = str(
             self.session_state.get("last_artifact_content", "") or ""
+        ).strip()
+        last_artifact_responder = str(
+            self.session_state.get("last_artifact_responder", "") or ""
         ).strip()
         last_responder = str(self.session_state.get("last_responder", "") or "").strip()
         last_tools_used = self.session_state.get("last_tools_used", [])
@@ -240,6 +356,7 @@ class OrchestratorAgent:
             session_lines.extend(
                 [
                     f"Last responder: {last_responder or 'unknown'}",
+                    f"Active artifact owner: {last_artifact_responder or 'unknown'}",
                     f"Last tools used: {', '.join(last_tools_used) if last_tools_used else 'none'}",
                     f"Last response excerpt:\n{excerpt}",
                 ]
@@ -260,51 +377,6 @@ class OrchestratorAgent:
             trace.append(f"(source={source}, confidence={confidence:.2f})", style="dim")
             self.console.print(trace)
 
-    def _generate_response(
-        self,
-        user_prompt: str,
-        *,
-        context: str,
-        stream: bool | None = None,
-    ) -> tuple[str, bool]:
-        """Generate a response from the local model."""
-        should_stream = self.settings.stream if stream is None else stream
-        if should_stream:
-            completion = self.model.complete(
-                self._build_messages(user_prompt, context),
-                stream=True,
-            )
-            return self._collect_stream(completion), True
-
-        with self.console.status(
-            "[bold magenta]OmniDex is thinking...[/bold magenta]",
-            spinner="dots",
-        ):
-            message = self.model.generate_text(
-                self._build_messages(user_prompt, context),
-                stream=False,
-            )
-
-        return message, False
-
-    def _collect_stream(self, events: Sequence[dict] | object) -> str:
-        """Render streaming tokens as they arrive."""
-        chunks: list[str] = []
-        with Live(
-            self._assistant_panel("", status="Thinking..."),
-            console=self.console,
-            refresh_per_second=12,
-        ) as live:
-            for event in events:
-                delta = event["choices"][0].get("delta", {})
-                piece = delta.get("content")
-                if not piece:
-                    continue
-                chunks.append(piece)
-                live.update(self._assistant_panel("".join(chunks)))
-        self.console.print()
-        return "".join(chunks).strip()
-
     def _handle_command(self, raw_input: str) -> int | None:
         """Handle slash commands; return an exit code when the session should stop."""
         if not raw_input:
@@ -320,12 +392,7 @@ class OrchestratorAgent:
             return 0
         if command in {"/clear", "/reset"}:
             self.memory.clear_short_term()
-            self.session_state = {
-                "last_response": "",
-                "last_artifact_content": "",
-                "last_responder": "",
-                "last_tools_used": [],
-            }
+            self.session_state = BaseAgent.empty_session_state()
             self.console.print("[green]Conversation reset.[/green]")
             return None
         if command == "/help":
@@ -368,42 +435,6 @@ class OrchestratorAgent:
             else Text(response or " ")
         )
         self.console.print(body)
-
-    def _assistant_panel(
-        self,
-        response: str,
-        *,
-        status: str | None = None,
-        title: str = "OmniDex",
-    ):
-        """Build the assistant panel for plain text or Markdown output."""
-        if status and not response:
-            return Group(
-                Spinner("dots", text=status, style="magenta"),
-                Text(" ", style="dim"),
-            )
-        return (
-            Markdown(response or " ")
-            if self.settings.render_markdown
-            else Text(response or " ")
-        )
-
-    def _build_messages(self, user_prompt: str, context: str) -> list[dict[str, str]]:
-        """Construct the message list sent to the LLM."""
-        system_content = self.system_prompt.strip()
-        memory_context = self._bounded_context(context)
-        if memory_context:
-            system_content = (
-                f"{system_content}\n\n"
-                "Use the memory context below when it is relevant. "
-                "Do not repeat it verbatim unless the user asks.\n\n"
-                f"{memory_context}"
-            )
-
-        return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_prompt},
-        ]
 
     def _bounded_context(self, context: str, *, limit: int = 2500) -> str:
         """Trim memory context to a safe length for local model prompts."""
