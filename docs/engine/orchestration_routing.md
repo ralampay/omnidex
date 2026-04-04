@@ -165,6 +165,11 @@ from the planner. `determine_output_write` and `extract_output_request` are only
 exposed when the current query contains an explicit output request. This reduces
 false write/save plans on generic concept questions.
 
+Planned save/export flows now also require internally valid state references.
+If a plan includes something like `$state.write_request.write_output`, an
+earlier step must actually produce `write_request`. Otherwise the planner
+rejects that plan and triggers a repair pass before execution.
+
 ### 4. Generic Tool Execution
 
 The executor loops through plan steps generically.
@@ -273,6 +278,11 @@ Current preferred path:
 For this case the system now usually takes a deterministic direct follow-up save
 path. The planner still supports it, but it is no longer required for the common
 case.
+
+When the planner is used for a save/export turn, incomplete plans are no longer
+allowed to fall through to execution. This avoids the failure mode where
+`create_output` renders the artifact but does not write the file because a
+referenced write-intent step was never produced.
 
 The filename extraction layer now supports common phrasings such as:
 

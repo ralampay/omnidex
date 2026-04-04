@@ -132,7 +132,8 @@ Why this is direct:
 
 - this is a persistence action, not a content-generation task
 - the artifact already exists in session state
-- the planner previously failed intermittently by stopping too early
+- the planner previously failed intermittently by stopping too early or by
+  emitting incomplete save plans
 
 ## Planned Tool Execution
 
@@ -156,6 +157,10 @@ The executor then:
 4. stores normalized results back into execution state
 
 This is a blackboard-style plan-and-execute loop.
+
+Before execution, the planner now also validates that any `$state.<output_key>`
+reference points to a step output that was already produced earlier in the same
+plan. If not, the plan is rejected and repaired.
 
 ### Planner Output Schema
 
@@ -211,6 +216,10 @@ Planner references are resolved using two forms:
 
 - `$name` for top-level state values such as `$query`
 - `$state.foo.bar` for nested tool outputs such as `$state.pdf_doc.text`
+
+For planned save/export flows, this matters directly. A plan that references
+`$state.write_request.write_output` without first producing `write_request` is
+now treated as invalid instead of being executed with a falsey write flag.
 
 ### Normalized Tool Result Schema
 

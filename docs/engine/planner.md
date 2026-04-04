@@ -28,6 +28,7 @@ The shared planner currently lives in:
 - planner LLM calls
 - repair retries when the model returns invalid plan JSON
 - normalization into `ToolPlanStep`
+- plan validation for internal state references before execution
 
 `planner_prompts.py` owns:
 
@@ -121,6 +122,27 @@ class ToolPlanStep:
     reason: str
 ```
 
+After normalization, the planner also validates cross-step references.
+
+That means a step such as:
+
+```json
+{
+  "tool_name": "create_output",
+  "inputs": {
+    "content": "$last_artifact_content",
+    "filename": "/home/user/out.md",
+    "write_output": "$state.write_request.write_output"
+  },
+  "output_key": "final"
+}
+```
+
+is rejected if no earlier step produced `write_request`.
+
+This prevents incomplete save/export plans from being executed with unresolved
+`$state.*` references.
+
 ## Execution Relationship
 
 The planner does not run tools directly.
@@ -129,14 +151,33 @@ The normal flow is:
 
 1. build planner
 2. generate plan
-3. pass that plan to `execute_tool_plan(...)`
-4. let the executor resolve references and run tools
+3. validate that any `$state.<output_key>...` references point to earlier plan outputs
+4. if validation fails, ask the model for a repaired plan
+5. pass the validated plan to `execute_tool_plan(...)`
+6. let the executor resolve references and run tools
 
 That separation matters:
 
 - planner decides
+- planner validates plan structure and cross-step references
 - executor performs
 - tools do domain work
+
+## Why Validation Was Added
+
+The planner can sometimes emit a save/export plan that looks plausible but is
+internally incomplete.
+
+Example failure mode:
+
+1. emit a `create_output` step
+2. reference `$state.write_request.write_output`
+3. never produce a `write_request` step earlier in the plan
+
+Without validation, that plan can render the artifact successfully while
+silently skipping the file write because `write_output` resolves to `None`.
+
+The current planner rejects that plan and uses the repair pass instead.
 
 ## Atomic Example
 
@@ -333,6 +374,7 @@ Use the shared planner when an agent:
 - has multiple tools
 - needs dynamic multi-step decisions
 - benefits from stateful tool chaining
+- can benefit from automatic repair when the model emits an incomplete plan
 
 Skip planner use when an agent:
 
