@@ -2,6 +2,13 @@
 
 A lightweight Python CLI for running local agents.
 
+## GGUF Models
+
+Suggested models that can run locally.
+
+* [Qwen 3.5 2b](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/tree/main)
+* [Gemma 4 E2b](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/tree/main)
+
 ## Documentation
 
 - [Docs Index](docs/README.md)
