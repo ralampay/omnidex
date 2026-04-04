@@ -8,6 +8,11 @@ This directory documents the agents currently shipped with omnidex.
 - `chat_agent`
 - `research_assistant`
 
+Detailed docs:
+
+- [orchestrator](./orchestrator.md)
+- [chat_agent](./chat_agent.md)
+
 ## Agent Overview
 
 - `orchestrator`: Runs as an interactive local-first delegator backed by a GGUF

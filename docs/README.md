@@ -15,6 +15,7 @@ This directory is the main table of contents for OmniDex documentation.
 
 - [Inference](./engine/inference.md)
 - [Agents Overview](./agents/README.md)
+- [Orchestrator Notes](./agents/orchestrator.md)
 - [Chat Agent Notes](./agents/chat_agent.md)
 - [Research Summarizer Notes](./agents/research_summarizer.md)
 - [Shared Memory Tutorial](./tutorials/demonstrating_shared_memory.md)
