@@ -11,6 +11,7 @@ class ReportInsightsTool(BaseTool):
     """Format report insights into a consistent markdown structure."""
 
     name = "report_insights"
+    output_fields = ("content",)
 
     def run(
         self,
@@ -20,19 +21,19 @@ class ReportInsightsTool(BaseTool):
         strengths: Iterable[str] | str | None = None,
         novel_approach: str = "",
         gaps_and_limitations: Iterable[str] | str | None = None,
-    ) -> str:
+    ) -> dict[str, object]:
         """Return a markdown report insight summary."""
-        normalized_title = title.strip() or "Untitled Report"
+        normalized_title = self._coerce_text(title) or "Untitled Report"
         normalized_keywords = self._normalize_items(keywords)
         normalized_strengths = self._normalize_items(strengths)
         normalized_gaps = self._normalize_items(gaps_and_limitations)
-        normalized_novel_approach = novel_approach.strip() or "None identified."
+        normalized_novel_approach = self._coerce_text(novel_approach) or "None identified."
 
         keyword_line = ", ".join(normalized_keywords) if normalized_keywords else "None"
         strength_lines = self._bullet_list(normalized_strengths)
         gap_lines = self._bullet_list(normalized_gaps)
 
-        return (
+        content = (
             f"# {normalized_title}\n\n"
             f"## Keywords\n"
             f"{keyword_line}\n\n"
@@ -43,6 +44,7 @@ class ReportInsightsTool(BaseTool):
             f"## Gaps and Limitations (in bullet points)\n\n"
             f"{gap_lines}"
         )
+        return {"status": "ok", "content": content}
 
     def _normalize_items(self, items: Iterable[str] | str | None) -> list[str]:
         """Normalize a string or iterable of strings into a cleaned list."""

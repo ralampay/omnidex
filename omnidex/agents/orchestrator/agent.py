@@ -16,6 +16,7 @@ from rich.text import Text
 from omnidex.memory import MemoryManager
 from omnidex.agents.research_assistant import ResearchAssistant
 from omnidex.runtime import LocalChatModel, LocalLLMSettings
+from omnidex.utils.json_tools import load_json_object
 
 
 DEFAULT_SYSTEM_PROMPT = """You are OmniDex, a local orchestrator agent.
@@ -23,34 +24,10 @@ DEFAULT_SYSTEM_PROMPT = """You are OmniDex, a local orchestrator agent.
 You run entirely against a local model and help the user interact with local agents.
 For now, behave as a capable general chat assistant. Be concise, accurate, and explicit
 about uncertainty. Do not claim to access remote services or tools unless the user asks
-for code or instructions to add them later.
+for code or instructions to add them later. Depending on the inquiry, you should delegate 
+tasks to one or more of the following agents:
+- research_assistant
 """
-
-ROUTER_SYSTEM_PROMPT = """You are a routing agent.
-
-Your task is to choose the best handler for the user input.
-
-Available options:
-- chat: general conversation
-- research_assistant: research queries, summarization, PDFs, keyword extraction
-
-Rules:
-- Choose "research_assistant" if the query involves:
-  - summarization
-  - PDFs
-  - documents
-  - extracting keywords
-  - analysis of text
-- Otherwise choose "chat"
-
-Respond with ONLY one word:
-chat
-or
-research_assistant
-
-Do not explain your answer.
-"""
-
 
 class OrchestratorAgent:
     """Local first-chat agent with a Rich terminal UI."""
@@ -69,8 +46,17 @@ class OrchestratorAgent:
             short_term_limit=self._short_term_limit(),
             long_term_path=self._memory_path(),
         )
+        self.session_state: dict[str, object] = {
+            "last_response": "",
+            "last_artifact_content": "",
+            "last_responder": "",
+            "last_tools_used": [],
+        }
         self.agents = {
-            "research_assistant": ResearchAssistant(console=self.console),
+            "research_assistant": ResearchAssistant(
+                console=self.console,
+                verbose=True,
+            ),
         }
 
     def run(self) -> int:
@@ -97,16 +83,17 @@ class OrchestratorAgent:
             return ""
 
         context = self._bounded_context(self.memory.get_context(user_prompt))
+        routing_context = self._routing_context(context)
         with self.console.status(
             "[bold blue]OmniDex is routing...[/bold blue]",
             spinner="dots",
         ):
             try:
-                route, confidence, route_source = self._route(user_prompt, context)
+                route, confidence, route_source = self._route(user_prompt, routing_context)
             except Exception:
-                route = self._heuristic_route(user_prompt)
+                route = "chat"
                 confidence = 0.0
-                route_source = "heuristic_fallback"
+                route_source = "default_fallback"
         self._render_event(
             f"Route selected: {route} ({route_source}, confidence={confidence:.2f})",
             style="blue",
@@ -124,6 +111,8 @@ class OrchestratorAgent:
             tools_used: list[str] = []
         else:
             agent = self.agents[route]
+            if hasattr(agent, "session_state"):
+                agent.session_state = dict(self.session_state)
             self._render_event(f"Active agent: {agent.name}", style="cyan")
             self._render_event(f"Delegating to agent: {agent.name}", style="cyan")
             with self.console.status(
@@ -134,12 +123,31 @@ class OrchestratorAgent:
             already_rendered = False
             responder = agent.name
             tools_used = list(agent.last_used_tools)
+            delegated_state = dict(getattr(agent, "session_state", {}))
 
         self.memory.add_interaction("user", user_prompt)
         self.memory.add_interaction("assistant", response)
         self.memory.extract_and_store(user_prompt, response)
+        preserved_artifact = str(self.session_state.get("last_artifact_content", "") or "").strip()
+        if route == "chat":
+            self.session_state = {
+                "last_response": response,
+                "last_artifact_content": preserved_artifact,
+                "last_responder": responder,
+                "last_tools_used": tools_used,
+            }
+        else:
+            delegated_artifact = str(
+                delegated_state.get("last_artifact_content", "") or ""
+            ).strip()
+            self.session_state = {
+                "last_response": str(delegated_state.get("last_response") or response),
+                "last_artifact_content": delegated_artifact or preserved_artifact,
+                "last_responder": str(delegated_state.get("last_responder") or responder),
+                "last_tools_used": delegated_state.get("last_tools_used", tools_used),
+            }
         self._render_event(
-            f"Tools used: {', '.join(tools_used) if tools_used else 'none'}",
+            f"Delegated agent tools used: {', '.join(tools_used) if tools_used else 'none'}",
             style="yellow",
         )
         self._render_event(f"Response source: {responder}", style="green")
@@ -148,14 +156,14 @@ class OrchestratorAgent:
         return response
 
     def _route(self, user_input: str, context: str) -> tuple[str, float, str]:
-        """Route with LLM classification first, then fall back to heuristics."""
+        """Route through the model over registered handlers."""
         route, confidence = self._llm_route(user_input, context)
-        if confidence >= 0.75:
+        if route in self._route_options():
             return route, confidence, "llm"
-        return self._heuristic_route(user_input), confidence, "heuristic_fallback"
+        return "chat", 0.0, "default_fallback"
 
     def _llm_route(self, user_input: str, context: str) -> tuple[str, float]:
-        """Ask the local model to choose a route and normalize the result."""
+        """Ask the local model to choose a route from registered options."""
         routing_input = user_input.strip()
         if context.strip():
             routing_input = (
@@ -164,34 +172,84 @@ class OrchestratorAgent:
             )
 
         messages = [
-            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+            {"role": "system", "content": self._build_router_system_prompt()},
             {"role": "user", "content": routing_input},
         ]
-        output = self.model.generate_text(messages, stream=False).lower()
-        normalized_output = " ".join(output.split())
-        if normalized_output == "research_assistant":
-            return "research_assistant", 1.0
-        if normalized_output == "chat":
-            return "chat", 1.0
-        if "research" in output and "chat" not in output:
-            return "research_assistant", 0.8
-        if "chat" in output and "research" not in output:
-            return "chat", 0.8
-        return "chat", 0.0
+        output = self.model.generate_text(messages, stream=False)
+        payload = load_json_object(output)
+        if payload is None:
+            normalized_output = " ".join(output.lower().split())
+            if normalized_output in self._route_options():
+                return normalized_output, 1.0
+            return "", 0.0
 
-    def _heuristic_route(self, user_input: str) -> str:
-        """Route deterministically when the LLM output is low-confidence."""
-        normalized = user_input.lower()
-        if (
-            "research" in normalized
-            or "summarize" in normalized
-            or ".pdf" in normalized
-            or "document" in normalized
-            or "keyword" in normalized
-            or "analy" in normalized
-        ):
-            return "research_assistant"
-        return "chat"
+        route = str(payload.get("route", "")).strip()
+        raw_confidence = payload.get("confidence", 0.0)
+        try:
+            confidence = float(raw_confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return route, max(0.0, min(1.0, confidence))
+
+    def _route_options(self) -> set[str]:
+        """Return the available route names."""
+        return {"chat", *self.agents.keys()}
+
+    def _build_router_system_prompt(self) -> str:
+        """Build a routing prompt from the registered agents."""
+        options = [
+            {
+                "name": "chat",
+                "description": "General conversation handled directly by the orchestrator.",
+            }
+        ]
+        for name, agent in self.agents.items():
+            description = getattr(agent, "description", "") or f"Delegates to {name}."
+            options.append({"name": name, "description": description})
+
+        option_lines = "\n".join(
+            f'- {option["name"]}: {option["description"]}'
+            for option in options
+        )
+        return (
+            "You are a routing agent.\n\n"
+            "Choose the best handler for the user input from the available options.\n"
+            "You will receive both conversation memory and session artifact state.\n"
+            "When the user refers to a previous artifact using phrases like 'save it', "
+            "'save this', 'write that', or 'export it', interpret that as a continuation "
+            "of the previous artifact if the session artifact state supports it.\n"
+            "Prefer the same handler that produced the prior artifact when the current "
+            "request is about persisting, exporting, or transforming that artifact.\n"
+            "Do not ignore session artifact state when the current user input is short or ambiguous.\n"
+            "Return ONLY valid JSON in this format:\n"
+            '{\n  "route": "chat",\n  "confidence": 0.0\n}\n\n'
+            f"Available options:\n{option_lines}\n"
+        )
+
+    def _routing_context(self, memory_context: str) -> str:
+        """Combine memory context with short-lived session artifact state."""
+        last_response = str(self.session_state.get("last_response", "") or "").strip()
+        last_artifact_content = str(
+            self.session_state.get("last_artifact_content", "") or ""
+        ).strip()
+        last_responder = str(self.session_state.get("last_responder", "") or "").strip()
+        last_tools_used = self.session_state.get("last_tools_used", [])
+        session_lines = ["Session Artifact State:"]
+        if last_response:
+            excerpt = self._bounded_context(last_response, limit=500)
+            session_lines.extend(
+                [
+                    f"Last responder: {last_responder or 'unknown'}",
+                    f"Last tools used: {', '.join(last_tools_used) if last_tools_used else 'none'}",
+                    f"Last response excerpt:\n{excerpt}",
+                ]
+            )
+            if last_artifact_content:
+                artifact_excerpt = self._bounded_context(last_artifact_content, limit=500)
+                session_lines.append(f"Last artifact excerpt:\n{artifact_excerpt}")
+        else:
+            session_lines.append("(no prior artifact)")
+        return "\n\n".join([memory_context, "\n".join(session_lines)])
 
     def _debug_route(self, route: str, confidence: float, source: str) -> None:
         """Print a dim route trace when verbose logging is enabled."""
@@ -262,6 +320,12 @@ class OrchestratorAgent:
             return 0
         if command in {"/clear", "/reset"}:
             self.memory.clear_short_term()
+            self.session_state = {
+                "last_response": "",
+                "last_artifact_content": "",
+                "last_responder": "",
+                "last_tools_used": [],
+            }
             self.console.print("[green]Conversation reset.[/green]")
             return None
         if command == "/help":

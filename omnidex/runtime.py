@@ -45,12 +45,67 @@ def env_str(name: str, default: str) -> str:
     return normalized or default
 
 
-def default_thread_count() -> int | None:
-    """Keep a couple of CPUs free for the rest of the machine."""
+def available_cpu_count() -> int | None:
+    """Return the CPU count available to this process."""
+    try:
+        affinity = os.sched_getaffinity(0)
+    except AttributeError:
+        affinity = None
+    if affinity:
+        return max(1, len(affinity))
     cpu_count = os.cpu_count()
     if cpu_count is None:
         return None
-    return max(1, cpu_count - 2)
+    return max(1, cpu_count)
+
+
+def physical_cpu_count() -> int | None:
+    """Best-effort physical core count for Linux hosts."""
+    topology_root = Path("/sys/devices/system/cpu")
+    if topology_root.exists():
+        core_keys: set[tuple[str, str]] = set()
+        for cpu_dir in topology_root.glob("cpu[0-9]*"):
+            package_file = cpu_dir / "topology" / "physical_package_id"
+            core_file = cpu_dir / "topology" / "core_id"
+            try:
+                package_id = package_file.read_text(encoding="utf-8").strip()
+                core_id = core_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if package_id and core_id:
+                core_keys.add((package_id, core_id))
+        if core_keys:
+            return len(core_keys)
+    return None
+
+
+def default_thread_count(device: str = "cpu") -> int | None:
+    """Dynamically choose a thread count suited to the current host."""
+    available_cpus = available_cpu_count()
+    if available_cpus is None:
+        return None
+
+    if device == "gpu":
+        return max(1, min(8, available_cpus // 2 or 1))
+
+    physical_cores = physical_cpu_count()
+    if physical_cores is not None:
+        return max(1, min(available_cpus, physical_cores))
+
+    if available_cpus <= 4:
+        return available_cpus
+    if available_cpus <= 8:
+        return max(1, available_cpus - 1)
+    return max(1, min(12, available_cpus - 2))
+
+
+def resolve_thread_count(device: str) -> int | None:
+    """Resolve thread count from env, using dynamic selection only when unset."""
+    raw_value = os.getenv("OMNIDEX_LLAMA_THREADS")
+    if raw_value is None or not raw_value.strip():
+        return default_thread_count(device)
+
+    return int(raw_value.strip())
 
 
 @dataclass(slots=True)
@@ -94,7 +149,7 @@ class LocalLLMSettings:
             top_p=env_float("OMNIDEX_LLAMA_TOP_P", 0.95) or 0.95,
             max_tokens=env_int("OMNIDEX_LLAMA_MAX_TOKENS", 512) or 512,
             ctx_size=env_int("OMNIDEX_LLAMA_CTX", 8192) or 8192,
-            threads=env_int("OMNIDEX_LLAMA_THREADS", default_thread_count()),
+            threads=resolve_thread_count(device),
             gpu_layers=resolve_gpu_layers(device),
             verbose=env_flag("OMNIDEX_LLAMA_VERBOSE", False),
             render_markdown=env_flag("OMNIDEX_RENDER_MARKDOWN", True),

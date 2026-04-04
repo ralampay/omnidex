@@ -42,7 +42,7 @@ If `OMNIDEX_DEVICE` is set to an unsupported value, `from_env(...)` raises a
 - `OMNIDEX_LLAMA_TOP_P`: top-p sampling value
 - `OMNIDEX_LLAMA_MAX_TOKENS`: maximum generated tokens per completion
 - `OMNIDEX_LLAMA_CTX`: llama.cpp context window size
-- `OMNIDEX_LLAMA_THREADS`: CPU thread count
+- `OMNIDEX_LLAMA_THREADS`: CPU thread count override as an integer
 - `OMNIDEX_LLAMA_GPU_LAYERS`: explicit GPU offload override
 - `OMNIDEX_LLAMA_VERBOSE`: whether llama.cpp logs remain visible
 - `OMNIDEX_RENDER_MARKDOWN`: higher-level CLI rendering default
@@ -54,7 +54,9 @@ If `OMNIDEX_DEVICE` is set to an unsupported value, `from_env(...)` raises a
 - `top_p` defaults to `0.95`
 - `max_tokens` defaults to `512`
 - `ctx_size` defaults to `8192`
-- `threads` defaults to `cpu_count - 2`, with a floor of `1`
+- `threads` defaults to dynamic selection only when `OMNIDEX_LLAMA_THREADS` is unset
+- Unset CPU threading prefers physical cores when they can be detected, otherwise it uses a bounded heuristic from available CPUs
+- Unset GPU threading uses a smaller CPU thread pool to avoid oversubscription while feeding GPU inference
 - `gpu_layers` defaults to `-1` when `OMNIDEX_DEVICE=gpu` and no explicit override is set
 - `gpu_layers` defaults to `0` on CPU when no explicit override is set
 - `verbose` defaults to `False`
