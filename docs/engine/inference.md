@@ -26,18 +26,19 @@ Inference requires these conditions to be satisfied before a model call can work
 - `OMNIDEX_LLAMA_MODEL_PATH` must be set
 - `OMNIDEX_LLAMA_MODEL_PATH` must point to an existing local GGUF file
 - the caller must provide a `system_prompt`
-- `OMNIDEX_DEVICE` must be either `cpu` or `gpu` if set
+- `OMNIDEX_DEVICE` must be `cpu`, `gpu`, or `vulkan` if set
 
 If `OMNIDEX_LLAMA_MODEL_PATH` is missing, `from_env(...)` raises a `ValueError`.
 If `OMNIDEX_DEVICE` is set to an unsupported value, `from_env(...)` raises a
-`ValueError`.
+`ValueError`. If `OMNIDEX_DEVICE=vulkan`, initialization also requires a
+Vulkan-enabled `llama-cpp-python` build and a visible system Vulkan loader.
 
 ### Environment Mapping
 
 `LocalLLMSettings.from_env(...)` resolves inference behavior from the environment.
 
 - `OMNIDEX_LLAMA_MODEL_PATH`: required absolute or expandable path to the GGUF model
-- `OMNIDEX_DEVICE`: runtime device, either `cpu` or `gpu`
+- `OMNIDEX_DEVICE`: runtime device, one of `cpu`, `gpu`, or `vulkan`
 - `OMNIDEX_LLAMA_TEMPERATURE`: sampling temperature
 - `OMNIDEX_LLAMA_TOP_P`: top-p sampling value
 - `OMNIDEX_LLAMA_MAX_TOKENS`: maximum generated tokens per completion
@@ -48,6 +49,22 @@ If `OMNIDEX_DEVICE` is set to an unsupported value, `from_env(...)` raises a
 - `OMNIDEX_RENDER_MARKDOWN`: higher-level CLI rendering default
 - `OMNIDEX_STREAM`: default inference streaming mode
 
+For Vulkan-backed inference, upstream `llama-cpp-python` expects the package to
+be built from source with the Vulkan backend enabled, for example:
+
+```bash
+sudo apt-get install -y libvulkan-dev glslc spirv-headers vulkan-tools
+CMAKE_ARGS="-DGGML_VULKAN=on" \
+pip install --upgrade --force-reinstall --no-cache-dir llama-cpp-python
+```
+
+Recommended runtime flags:
+
+```bash
+export OMNIDEX_DEVICE=vulkan
+export OMNIDEX_LLAMA_GPU_LAYERS=-1
+```
+
 ### Default Resolution Rules
 
 - `temperature` defaults to `0.2`
@@ -57,7 +74,7 @@ If `OMNIDEX_DEVICE` is set to an unsupported value, `from_env(...)` raises a
 - `threads` defaults to dynamic selection only when `OMNIDEX_LLAMA_THREADS` is unset
 - Unset CPU threading prefers physical cores when they can be detected, otherwise it uses a bounded heuristic from available CPUs
 - Unset GPU threading uses a smaller CPU thread pool to avoid oversubscription while feeding GPU inference
-- `gpu_layers` defaults to `-1` when `OMNIDEX_DEVICE=gpu` and no explicit override is set
+- `gpu_layers` defaults to `-1` when `OMNIDEX_DEVICE=gpu` or `OMNIDEX_DEVICE=vulkan` and no explicit override is set
 - `gpu_layers` defaults to `0` on CPU when no explicit override is set
 - `verbose` defaults to `False`
 - `render_markdown` defaults to `True`
@@ -118,6 +135,15 @@ Llama(
     verbose=settings.verbose,
 )
 ```
+
+Before constructing `Llama(...)`, `LocalChatModel` also preflights GPU backend
+compatibility:
+
+- any GPU mode requires `llama_cpp.llama_supports_gpu_offload()` to be true
+- `OMNIDEX_DEVICE=vulkan` additionally requires a Vulkan backend library in the
+  installed `llama-cpp-python` package
+- `OMNIDEX_DEVICE=vulkan` also requires the system `libvulkan` loader to be
+  present
 
 ### Inference Call Contract
 

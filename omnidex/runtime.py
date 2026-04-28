@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from dataclasses import dataclass
+import ctypes.util
 import importlib.metadata
 import os
 from pathlib import Path
@@ -88,7 +89,7 @@ def default_thread_count(device: str = "cpu") -> int | None:
     if available_cpus is None:
         return None
 
-    if device == "gpu":
+    if uses_gpu(device):
         return max(1, min(8, available_cpus // 2 or 1))
 
     physical_cores = physical_cpu_count()
@@ -109,6 +110,43 @@ def resolve_thread_count(device: str) -> int | None:
         return default_thread_count(device)
 
     return int(raw_value.strip())
+
+
+def uses_gpu(device: str) -> bool:
+    """Return whether the selected runtime mode offloads work to a GPU backend."""
+    return device in {"gpu", "vulkan"}
+
+
+def installed_llama_cpp_backend_libs() -> set[str]:
+    """Return backend libraries shipped with the installed llama-cpp-python."""
+    try:
+        import llama_cpp
+    except ImportError:
+        return set()
+
+    lib_root = Path(llama_cpp.__file__).resolve().parent / "lib"
+    if not lib_root.exists():
+        return set()
+
+    backends: set[str] = set()
+    for path in lib_root.iterdir():
+        name = path.name.casefold()
+        if "ggml-vulkan" in name:
+            backends.add("vulkan")
+        elif "ggml-cuda" in name:
+            backends.add("cuda")
+        elif "ggml-hip" in name or "ggml-hipblas" in name:
+            backends.add("hip")
+        elif "ggml-metal" in name:
+            backends.add("metal")
+        elif "ggml-sycl" in name:
+            backends.add("sycl")
+    return backends
+
+
+def has_vulkan_loader() -> bool:
+    """Return whether the system Vulkan loader is visible to the process."""
+    return ctypes.util.find_library("vulkan") is not None
 
 
 @dataclass(slots=True)
@@ -139,9 +177,9 @@ class LocalLLMSettings:
             )
 
         device = env_str("OMNIDEX_DEVICE", "cpu").casefold()
-        if device not in {"cpu", "gpu"}:
+        if device not in {"cpu", "gpu", "vulkan"}:
             raise ValueError(
-                "OMNIDEX_DEVICE must be either 'cpu' or 'gpu'."
+                "OMNIDEX_DEVICE must be one of 'cpu', 'gpu', or 'vulkan'."
             )
 
         return cls(
@@ -165,7 +203,7 @@ def resolve_gpu_layers(device: str) -> int:
     configured_layers = env_int("OMNIDEX_LLAMA_GPU_LAYERS")
     if configured_layers is not None:
         return configured_layers
-    if device == "gpu":
+    if uses_gpu(device):
         return -1
     return 0
 
@@ -176,6 +214,15 @@ def installed_llama_cpp_version() -> str | None:
         return importlib.metadata.version("llama-cpp-python")
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def llama_supports_gpu_offload() -> bool:
+    """Return whether the installed llama-cpp-python exposes GPU offload."""
+    try:
+        import llama_cpp
+    except ImportError:
+        return False
+    return bool(llama_cpp.llama_supports_gpu_offload())
 
 
 def read_gguf_architecture(model_path: Path) -> str | None:
@@ -353,6 +400,7 @@ class LocalChatModel:
 
     def _preflight_model_compatibility(self) -> None:
         """Reject known-incompatible GGUF/runtime combinations before loading."""
+        self._preflight_backend_compatibility()
         architecture = read_gguf_architecture(self.settings.model_path)
         runtime_version = installed_llama_cpp_version()
         if architecture == "gemma4" and runtime_version == "0.3.19":
@@ -362,4 +410,38 @@ class LocalChatModel:
                 f"supported by the installed llama-cpp-python {runtime_version} "
                 "in this environment. Upgrade llama-cpp-python / llama.cpp or "
                 "switch to a supported GGUF."
+            )
+
+    def _preflight_backend_compatibility(self) -> None:
+        """Reject runtime modes unsupported by the installed llama.cpp backend."""
+        if not uses_gpu(self.settings.device):
+            return
+
+        backend_libs = installed_llama_cpp_backend_libs()
+        if not llama_supports_gpu_offload():
+            available = ", ".join(sorted(backend_libs)) or "cpu-only build"
+            raise ValueError(
+                "OMNIDEX_DEVICE requests GPU offload, but the installed "
+                f"llama-cpp-python build does not support it. Detected backend "
+                f"libraries: {available}. Reinstall llama-cpp-python with a GPU "
+                "backend enabled."
+            )
+
+        if self.settings.device != "vulkan":
+            return
+
+        if "vulkan" not in backend_libs:
+            available = ", ".join(sorted(backend_libs)) or "cpu-only build"
+            raise ValueError(
+                "OMNIDEX_DEVICE=vulkan requires a Vulkan-enabled "
+                "llama-cpp-python build, but no Vulkan backend library was "
+                f"detected. Detected backend libraries: {available}. Reinstall "
+                "llama-cpp-python with `-DGGML_VULKAN=on`."
+            )
+
+        if not has_vulkan_loader():
+            raise ValueError(
+                "OMNIDEX_DEVICE=vulkan requires the system Vulkan loader, but "
+                "`libvulkan` was not found. Install the Vulkan runtime/devel "
+                "packages for your OS and verify `vulkaninfo` works."
             )

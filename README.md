@@ -25,6 +25,30 @@ source env/bin/activate
 pip install -r requirements.txt
 ```
 
+### Vulkan-enabled llama.cpp
+
+If you want llama.cpp to use Vulkan through `llama-cpp-python`, install a
+Vulkan-capable build of the Python package and keep `OMNIDEX_DEVICE=vulkan`.
+
+Linux packages typically needed before the Python install:
+
+```bash
+sudo apt-get install -y libvulkan-dev glslc spirv-headers vulkan-tools
+```
+
+Rebuild `llama-cpp-python` with the Vulkan backend enabled:
+
+```bash
+CMAKE_ARGS="-DGGML_VULKAN=on" \
+pip install --upgrade --force-reinstall --no-cache-dir llama-cpp-python
+```
+
+Verify the host can see Vulkan before running OmniDex:
+
+```bash
+vulkaninfo
+```
+
 ## Environment Variables
 
 This project uses dotenv files. Copy `.env.dist` to `.env` and update values.
@@ -58,13 +82,13 @@ It now includes:
 CLI logging:
 - `OMNIDEX_RENDER_MARKDOWN` (default `1`)
 - `OMNIDEX_LLAMA_MODEL_PATH` (required)
-- `OMNIDEX_DEVICE` (`cpu` by default, set to `gpu` for CUDA-backed loading)
+- `OMNIDEX_DEVICE` (`cpu` by default; use `gpu` for any GPU-enabled llama.cpp build or `vulkan` to require Vulkan specifically)
 - `OMNIDEX_LLAMA_TEMPERATURE` (optional)
 - `OMNIDEX_LLAMA_MAX_TOKENS` (optional)
 - `OMNIDEX_LLAMA_TOP_P` (optional)
 - `OMNIDEX_LLAMA_CTX` (optional runtime context length)
 - `OMNIDEX_LLAMA_THREADS` (optional CPU thread count)
-- `OMNIDEX_LLAMA_GPU_LAYERS` (optional GPU offload override; defaults to all layers on `gpu`, `0` on `cpu`)
+- `OMNIDEX_LLAMA_GPU_LAYERS` (optional GPU offload override; defaults to all layers on `gpu` or `vulkan`, `0` on `cpu`)
 - `OMNIDEX_LLAMA_VERBOSE` (set to `1` to show llama.cpp logs)
 - `OMNIDEX_STREAM` (set to `1` to stream tokens live in the terminal)
 - `OMNIDEX_SHORT_TERM_LIMIT` (optional recent-message window, default `5`)
@@ -74,6 +98,7 @@ CLI logging:
 
 ```bash
 export OMNIDEX_LLAMA_MODEL_PATH=/path/to/model.gguf
+export OMNIDEX_DEVICE=vulkan
 python -m omnidex
 ```
 
